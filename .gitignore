@@ -1,4 +1,6 @@
 RC5XWIN/
+RC5XMAC/
+
 
 # Build output / intermediate dirs (any level)
 bin/
