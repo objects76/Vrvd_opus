@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 #include "scapdec.h"
+#include "config.h" /* SCAP_CODEC_NAME for the title bar */
 #include "scap_stream.h"
 
 static ScapDec*        g_dec;
@@ -90,8 +91,10 @@ static void UpdateTitle(void)
     if (elapsed < 1000)
         return;
     char buf[160];
-    _snprintf_s(buf, _TRUNCATE, "scap viewer [%s] - %u fps, last pkt %u B, %s",
-                g_host, g_frames * 1000 / elapsed, g_lastPktSize, g_status);
+    _snprintf_s(buf, _TRUNCATE,
+                "scap viewer [%s] - %s, %u fps, last pkt %u B, %s",
+                g_host, SCAP_CODEC_NAME, g_frames * 1000 / elapsed,
+                g_lastPktSize, g_status);
     SetWindowTextA(g_hwnd, buf);
     g_frames = 0;
     g_fpsTick = now;

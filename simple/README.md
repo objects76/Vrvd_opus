@@ -6,11 +6,14 @@
 
 ## 구성
 
+아래 표의 scapenc/scapdec 설명은 zstd 경로(`USE_AV1 0`) 기준이다. 기본 빌드는
+AV1 코덱을 쓴다 — "코덱 선택 (common/config.h `USE_AV1`)" 절 참조.
+
 | 폴더 | 산출물 | 내용 |
 |---|---|---|
 | `scapenc` | scapenc.dll | DXGI Desktop Duplication(`IDXGIOutput1::DuplicateOutput`, BGRA32) → 변경 검증(`dirty_verify.h`: DXGI move/dirty를 prev 프레임과 블록 비교해 실제 변경 픽셀만 남김 — 블록 크기는 레거시 `check_changed_bits`의 적응형 휴리스틱, rect 폭 ≥32→64px / 16~31→16px / <16→8px, 8px 셀 그리드로 병합; 과대 보고 프레임은 NOCHANGE로 탈락) → RGB332 + Bayer 4x4 dithering으로 8bpp 변환 → 프레임 payload 전체를 메모리에 모은 뒤 zstd 스트리밍 flush 1회(`ZSTD_compressStream2` + `ZSTD_e_flush`, level 3 = `ZSTD_CLEVEL_DEFAULT`, `windowLog=21`(2MiB ≈ FHD 8bpp 한 프레임 — 직전 프레임이 사전 역할; 4K 대상이면 23으로) — `research/zstd_stream.hpp` 및 zstd 비교 research 참조. 입출력 버퍼는 청킹 없이 프레임 payload 전체/`ZSTD_compressBound` 1회 — length-prefix 패킷이라 blob 전체가 만들어져야 전송 가능하므로 청킹은 이득 없음). CCtx가 인코더 수명 동안 유지되어 이후 패킷이 이전 프레임 payload를 history로 참조 → 프레임 간 반복 콘텐츠가 극도로 잘 압축됨. 새 뷰어 접속 시 `ScapEnc_RequestFullFrame()`이 전체 프레임 재전송 + zstd 세션 리셋(새 zstd frame 시작 — 새 디코더가 frame boundary에서 합류) |
 | `scapdec` | scapdec.dll | `ZSTD_decompressStream`(DCtx를 디코더 수명 동안 유지, 패킷은 스트림 순서대로 공급) → rect별 8bpp DIBSection 캔버스 blit → `BitBlt` 페인트 |
-| `common` | (헤더) | wire format(`scap_packet.h`), 양자화 어댑터(`scap_palette.h` — 사용처는 이것만 include, `ScapQuantInit`/`ScapQuantPixel` 공통 인터페이스). 백엔드 선택: 기본은 RGB332+Bayer dither(`scap_332dither.h`, 디더 패턴은 프레임 절대좌표 고정이라 결정적 — `research/2026-07-08-32bpp_RGB_이미지를_256컬러로_변환하기.md` 참조; rect 변환은 런타임 CPU 감지로 AVX2 경로 자동 사용, 미지원 CPU는 스칼라 폴백, 출력은 byte-exact 동일), `scap_palette.h`의 `SCAP_USE_256MAP`을 켜면 레거시 240색 팔레트+LUT(`scap_256map.h`) |
+| `common` | (헤더) | wire format(`scap_packet.h`), zstd 스트리밍 래퍼(`zstd_stream.h` — `zs::StreamCompressor`/`zs::StreamDecompressor`, `research/zstd_stream.hpp`와 동일한 Sink/Options 스타일에 FHD 튜닝 기본값(level 3, windowLog 21, LDM off) 적용; scapenc·scapdec·viewer_x11·test가 공유, DLL 경계에서 예외→반환코드 변환), 양자화 어댑터(`scap_palette.h` — 사용처는 이것만 include, `ScapQuantInit`/`ScapQuantPixel` 공통 인터페이스). 백엔드 선택: 기본은 RGB332+Bayer dither(`scap_332dither.h`, 디더 패턴은 프레임 절대좌표 고정이라 결정적 — `research/2026-07-08-32bpp_RGB_이미지를_256컬러로_변환하기.md` 참조; rect 변환은 런타임 CPU 감지로 AVX2 경로 자동 사용, 미지원 CPU는 스칼라 폴백, 출력은 byte-exact 동일), `scap_palette.h`의 `SCAP_USE_256MAP`을 켜면 레거시 240색 팔레트+LUT(`scap_256map.h`) |
 | `zstd-v1.5.7-win64` | libzstd.dll | 공식 zstd v1.5.7 Windows 바이너리 배포판. MSVC에서는 `dll\libzstd.dll.a`(임포트 lib)로 링크 — `static\libzstd_static.lib`는 MinGW 빌드라 MSVC와 링크 불가(`___chkstk_ms` 미해결). scapenc 빌드 후 `libzstd.dll`이 출력 폴더로 자동 복사되며, scapenc/scapdec.dll 배포 시 함께 가져가야 함 |
 | `test` | test.exe | 루프백: 캡처→인코딩→디코딩→창 표시. 타이틀바에 fps/패킷 크기/상태 |
 | `streamserver` | streamserver.exe | 콘솔 서버: scapenc 캡처 패킷을 TCP 44300으로 스트리밍(길이 프리픽스 프레이밍). 한 번에 한 클라이언트 |
@@ -29,6 +32,39 @@ msbuild simple\simple.sln -p:Configuration=Release -p:Platform=x64
 ```
 
 산출물: `simple\bin\<Platform>\<Configuration>\` (test.exe와 DLL이 같은 폴더).
+
+### 코덱 선택 (common/config.h `USE_AV1`)
+
+`common/config.h`의 `USE_AV1`이 scapenc/scapdec의 코덱을 빌드 타임에 정한다.
+
+- `USE_AV1 1` (기본): **AV1**. scapenc가 캡처 프레임 전체를 libaom으로 인코딩
+  (Chrome Remote Desktop과 동일 설정 — Chromium
+  `remoting/codec/webrtc_video_encoder_av1.cc`: `AOM_USAGE_REALTIME` +
+  `AV1E_SET_TUNE_CONTENT=AOM_CONTENT_SCREEN` + cpu-used 11 + CBR + zero-lag +
+  cyclic-refresh AQ, `common/av1_encoder.h`), scapdec이 dav1d로 디코딩
+  (WebRTC `dav1d_decoder.cc`처럼 `max_frame_delay=1`,
+  `common/av1_decoder.h`)해 32bpp BGRA 캔버스에 그린다. dirty rect/move
+  기계는 사용하지 않는다(코덱 inter prediction이 그 역할). 비트레이트는
+  `SCAP_AV1_BITRATE_KBPS`(기본 8000) 고정 CBR.
+- `USE_AV1 0`: 기존 8bpp 팔레트 + 스트리밍 zstd 경로.
+
+양단이 같은 값으로 빌드돼야 한다(매직이 달라 불일치는 디코드 거부로 드러남).
+viewer_x11(Linux)은 아직 zstd 경로만 구현 — 그쪽과 테스트할 땐 `USE_AV1 0`.
+`test.exe -packettest`는 zstd 와이어포맷 전용이라 `USE_AV1 1`이면 스킵(exit 0).
+
+AV1용 라이브러리는 vcpkg로 설치 — 이 솔루션은 정적 CRT(/MT)라 static
+triplet이어야 한다:
+
+```
+git clone https://github.com/microsoft/vcpkg F:\vcpkg
+F:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+F:\vcpkg\vcpkg install aom:x64-windows-static dav1d:x64-windows-static
+```
+
+scapenc(aom)·scapdec(dav1d)이 x64에서 include/link한다. vcpkg 경로가 다르면
+`msbuild -p:VcpkgStaticDir=<...>\installed\x64-windows-static`으로 재지정
+(기본값 `F:\vcpkg\installed\x64-windows-static`). 정적 링크라 배포할 DLL은
+없다.
 
 ## 실행/검증
 
@@ -60,10 +96,15 @@ viewer.exe [host]           # host(기본 127.0.0.1):44300 접속 → 화면 표
 ## Wire format
 
 ```
-Packet = ScapFrameHdr(16B) + zstd blob
-ScapFrameHdr: u32 magic 'SCP2' | u16 width | u16 height | u16 rectCount | u16 moveCount | u32 rawSize
+Packet = ScapFrameHdr(16B) + zstd blob                                    // USE_AV1=0, magic 'SCP2'
+ScapFrameHdr: u32 magic | u16 width | u16 height | u16 rectCount | u16 moveCount | u32 rawSize
 Payload(해제 후) = moveCount × { u16 srcX,srcY,x,y,w,h }                  // copy op
                  + rectCount × { u16 x,y,w,h + u8 pixels[w*h] }           // 8bpp, row padding 없음
+
+Packet = ScapFrameHdr(16B) + AV1 temporal unit                            // USE_AV1=1, magic 'SCA1'
+  rectCount = moveCount = 0, rawSize = OBU 바이트 길이. 항상 전체 프레임.
+  스트림 순서로 한 디코더에 공급; 새 디코더는 키프레임에서만 합류
+  (ScapEnc_RequestFullFrame()이 강제, 서버가 접속마다 호출).
 ```
 
 zstd blob은 인코더의 **연속 zstd frame을 패킷마다 flush한 조각**이다: 패킷은 독립

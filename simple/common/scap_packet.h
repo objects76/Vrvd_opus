@@ -28,6 +28,15 @@
 
 #define SCAP_MAGIC 0x32504353u /* 'S','C','P','2' little-endian; 1 was zlib */
 
+/* AV1 packet (common/config.h USE_AV1=1): same 16-byte ScapFrameHdr but the
+ * body is one raw AV1 temporal unit (libaom OBU stream) for the full frame -
+ * no move/rect payload, so rectCount = moveCount = 0 and rawSize = OBU byte
+ * length (== packet size - header; kept for sanity checking). Packets must
+ * be fed to ONE decoder in stream order; a decoder can only join at a
+ * keyframe, which ScapEnc_RequestFullFrame() forces (the server calls it per
+ * new connection). Distinct magic so a codec-mismatched peer fails loudly. */
+#define SCAP_MAGIC_AV1 0x31414353u /* 'S','C','A','1' little-endian */
+
 #pragma pack(push, 1)
 typedef struct ScapFrameHdr
 {

@@ -30,13 +30,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <zstd.h>
 #include <mutex>
 #include <thread>
 #include <vector>
 #include "../common/scap_packet.h"
 #include "../common/scap_palette.h"
 #include "../common/scap_stream.h"
+#include "../common/zstd_stream.h"
 
 struct DirtyRect { int x0, y0, x1, y1; }; /* half-open; empty when x1<=x0 */
 
@@ -45,20 +45,16 @@ struct DirtyRect { int x0, y0, x1, y1; }; /* half-open; empty when x1<=x0 */
 static_assert(sizeof(ScapInputMsg) == 16, "ScapInputMsg wire size");
 
 /* Decoder state: scapdec.cpp's ScapDec minus the GDI objects. Stride == width
- * (no DIB 4-byte row alignment needed on a plain buffer). The DCtx persists
- * across packets: the server flushes one continuing zstd frame, so packets
- * reference earlier ones as history and must be decoded in order. */
+ * (no DIB 4-byte row alignment needed on a plain buffer). The
+ * zs::StreamDecompressor persists across packets: the server flushes one
+ * continuing zstd frame, so packets reference earlier ones as history and
+ * must be decoded in order. */
 struct Dec
 {
     int width = 0, height = 0;
     std::vector<uint8_t> canvas; /* 8bpp palette indices, top-down */
     std::vector<uint8_t> raw;    /* decompress scratch */
-    ZSTD_DCtx* dctx = ZSTD_createDCtx();
-    /* cap window demands at 16MB: headroom over scapenc's windowLog 21 so a
-     * future 4K bump (23) needs no viewer change; allocation follows the
-     * frame's declared window (~2MiB) */
-    Dec() { if (dctx) ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, 24); }
-    ~Dec() { ZSTD_freeDCtx(dctx); }
+    zs::StreamDecompressor zdec;
 };
 
 static Dec           g_dec;
@@ -98,18 +94,30 @@ static int DecodePacket(Dec* d, const void* packet, unsigned size, DirtyRect* ou
     if (d->raw.size() < hdr.rawSize)
         d->raw.resize(hdr.rawSize);
 
-    /* Streaming decode: consume the whole blob, expect exactly rawSize out
-     * (the encoder flushed everything for this packet). */
-    ZSTD_inBuffer  zin = { (const uint8_t*)packet + sizeof(hdr),
-                           size - sizeof(hdr), 0 };
-    ZSTD_outBuffer zout = { d->raw.data(), hdr.rawSize, 0 };
-    while (zin.pos < zin.size)
+    /* Decode the blob through the sink into raw, expecting exactly rawSize
+     * bytes out (the encoder flushed everything for this packet). Excess
+     * output means the packet lies about rawSize: clamp the copy and fail. */
+    size_t got = 0;
+    bool over = false;
+    try
     {
-        size_t rc = ZSTD_decompressStream(d->dctx, &zout, &zin);
-        if (ZSTD_isError(rc) || (zout.pos == zout.size && zin.pos < zin.size))
-            return -3;
+        d->zdec.decompress((const uint8_t*)packet + sizeof(hdr),
+                           size - sizeof(hdr),
+                           [d, &hdr, &got, &over](const void* p, size_t n) {
+                               if (got + n > hdr.rawSize)
+                               {
+                                   over = true;
+                                   n = hdr.rawSize - got;
+                               }
+                               memcpy(d->raw.data() + got, p, n);
+                               got += n;
+                           });
     }
-    if (zout.pos != hdr.rawSize)
+    catch (...)
+    {
+        return -3;
+    }
+    if (over || got != hdr.rawSize)
         return -3;
 
     const uint8_t* p = d->raw.data();
@@ -284,10 +292,10 @@ static uint64_t NowMs(void)
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* Headless check of the decode path: two packets flushed from one streaming
- * CCtx (packet 2 continues packet 1's zstd frame, so decoding it proves the
- * DCtx persists across packets), verify pixels, bounds and malformed-packet
- * rejection. */
+/* Headless check of the decode path: two packets flushed from one
+ * zs::StreamCompressor (packet 2 continues packet 1's zstd frame, so
+ * decoding it proves the zs::StreamDecompressor persists across packets),
+ * verify pixels, bounds and malformed-packet rejection. */
 static int SelfTest(void)
 {
     std::vector<uint8_t> payload;
@@ -298,23 +306,19 @@ static int SelfTest(void)
     payload.insert(payload.end(), (size_t)r2.w * r2.h, 3);
 
     ScapFrameHdr hdr = { SCAP_MAGIC, 8, 5, 2, 0, (uint32_t)payload.size() };
-    ZSTD_CCtx* cctx = ZSTD_createCCtx();
-    assert(cctx);
-    ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, ZSTD_CLEVEL_DEFAULT);
+    zs::StreamCompressor enc;
     auto build = [&](std::vector<uint8_t>& pkt) {
-        pkt.resize(sizeof(hdr) + ZSTD_compressBound(payload.size()));
-        ZSTD_inBuffer in = { payload.data(), payload.size(), 0 };
-        ZSTD_outBuffer out = { pkt.data() + sizeof(hdr),
-                               pkt.size() - sizeof(hdr), 0 };
-        size_t rem = ZSTD_compressStream2(cctx, &out, &in, ZSTD_e_flush);
-        assert(!ZSTD_isError(rem) && rem == 0 && in.pos == in.size);
+        pkt.resize(sizeof(hdr));
+        enc.compressFrame(payload.data(), payload.size(),
+                          [&pkt](const void* p, size_t n) {
+                              pkt.insert(pkt.end(), (const uint8_t*)p,
+                                         (const uint8_t*)p + n);
+                          });
         memcpy(pkt.data(), &hdr, sizeof(hdr));
-        pkt.resize(sizeof(hdr) + out.pos);
     };
     std::vector<uint8_t> pkt1, pkt2;
     build(pkt1);
     build(pkt2);
-    ZSTD_freeCCtx(cctx);
 
     Dec d;
     DirtyRect b;

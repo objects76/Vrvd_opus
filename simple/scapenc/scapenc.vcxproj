@@ -35,11 +35,16 @@
   <PropertyGroup>
     <OutDir>$(SolutionDir)bin\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)obj\$(ProjectName)\$(Platform)\$(Configuration)\</IntDir>
+    <!-- libaom (AV1 encoder, common/config.h USE_AV1) from
+         `vcpkg install aom:x64-windows-static` - the static CRT triplet
+         matches the /MT RuntimeLibrary below. x64 only. -->
+    <VcpkgStaticDir Condition="'$(VcpkgStaticDir)'==''">F:\vcpkg\installed\x64-windows-static</VcpkgStaticDir>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <AdditionalIncludeDirectories>..\common;..\zstd-v1.5.7-win64\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories Condition="'$(Platform)'=='x64'">$(VcpkgStaticDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>SCAPENC_EXPORTS;WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary Condition="'$(Configuration)'=='Debug'">MultiThreadedDebug</RuntimeLibrary>
       <RuntimeLibrary Condition="'$(Configuration)'=='Release'">MultiThreaded</RuntimeLibrary>
@@ -51,7 +56,10 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <AdditionalLibraryDirectories>..\zstd-v1.5.7-win64\dll;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories Condition="'$(Platform)'=='x64' And '$(Configuration)'=='Release'">$(VcpkgStaticDir)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories Condition="'$(Platform)'=='x64' And '$(Configuration)'=='Debug'">$(VcpkgStaticDir)\debug\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>d3d11.lib;dxgi.lib;user32.lib;libzstd.dll.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies Condition="'$(Platform)'=='x64'">aom.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <Command>xcopy /D /Y "$(ProjectDir)..\zstd-v1.5.7-win64\dll\libzstd.dll" "$(OutDir)"</Command>
@@ -67,10 +75,12 @@
     <ClInclude Include="dxgidup.h" />
     <ClInclude Include="dirty_verify.h" />
     <None Include="dirty_verify_test.cpp" />
+    <ClInclude Include="..\common\config.h" />
     <ClInclude Include="..\common\scap_packet.h" />
     <ClInclude Include="..\common\scap_palette.h" />
     <ClInclude Include="..\common\scap_332dither.h" />
     <ClInclude Include="..\common\scap_256map.h" />
+    <ClInclude Include="..\common\av1_encoder.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
