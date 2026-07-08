@@ -378,6 +378,7 @@ int main(int argc, char** argv)
     pollfd fds[2] = { { ConnectionNumber(dpy), POLLIN, 0 },
                       { g_pipe[0], POLLIN, 0 } };
     bool quit = false;
+    int lastW = 0, lastH = 0; /* canvas size the window was last sized to */
     while (!quit)
     {
         poll(fds, 2, 500);
@@ -430,6 +431,25 @@ int main(int argc, char** argv)
             if (r.x1 > u.x1) u.x1 = r.x1;
             if (r.y1 > u.y1) u.y1 = r.y1;
         }
+        /* First frame (or server resolution change): snap the window to the
+         * canvas so the 1:1 blit fits exactly. Clamped to the screen size;
+         * ponytail: no scaling, a canvas larger than the screen is cropped -
+         * scaling the blit in PaintRect would be the upgrade path. */
+        int cw, ch;
+        {
+            std::lock_guard<std::mutex> l(g_lock);
+            cw = g_dec.width;
+            ch = g_dec.height;
+        }
+        if (cw && (cw != lastW || ch != lastH))
+        {
+            int w = cw < DisplayWidth(dpy, scr) ? cw : DisplayWidth(dpy, scr);
+            int h = ch < DisplayHeight(dpy, scr) ? ch : DisplayHeight(dpy, scr);
+            XResizeWindow(dpy, win, w, h);
+            lastW = cw;
+            lastH = ch;
+        }
+
         if (u.x1 > u.x0)
             PaintRect(dpy, win, gc, u.x0, u.y0, u.x1, u.y1);
 
