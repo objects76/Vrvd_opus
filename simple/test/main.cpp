@@ -180,14 +180,38 @@ static int CompareCanvas(ScapDec* dec, const std::vector<uint8_t>& ref,
 
 static int PacketTest(void)
 {
+#ifndef SCAP_USE_256MAP
     /* 0: palette/quantizer roundtrip - expanding an index through kScapPal
      * and re-quantizing at (0,0) (Bayer offset 0) must return the same
-     * index; fails if the RGB332 pack/expand shifts ever disagree. */
+     * index; fails if the RGB332 pack/expand shifts ever disagree. Not
+     * meaningful for the 256map backend: its palette has duplicate colors
+     * and the LUT truncates to RGB555 first. */
     for (int i = 0; i < 256; ++i)
     {
         uint8_t px[4] = { kScapPal[i].b, kScapPal[i].g, kScapPal[i].r, 0 };
         if (ScapQuant332(px, 0, 0) != i)
             return 10;
+    }
+#endif
+
+    /* 0b: rect quantizer (AVX2 path where the CPU has it) must match the
+     * per-pixel adapter byte-for-byte. Odd width exercises the vector tail,
+     * odd x0/y0 the Bayer phase alignment, stride > w*4 the row walk. */
+    {
+        const int TW = 61, TH = 13, STRIDE = (TW + 3) * 4;
+        std::vector<uint8_t> img((size_t)STRIDE * TH);
+        for (size_t i = 0; i < img.size(); ++i)
+            img[i] = (uint8_t)((i * 2654435761u) >> 13); /* incl. near-255 */
+        ScapQuant q;
+        ScapQuantInit(&q);
+        std::vector<uint8_t> got((size_t)TW * TH);
+        ScapQuantRect(&q, img.data(), STRIDE, got.data(), TW, TH, 3, 2);
+        for (int yy = 0; yy < TH; ++yy)
+            for (int xx = 0; xx < TW; ++xx)
+                if (got[(size_t)yy * TW + xx] !=
+                    ScapQuantPixel(&q, &img[(size_t)yy * STRIDE + xx * 4],
+                                   3 + xx, 2 + yy))
+                    return 10;
     }
 
     const int W = 64, H = 48;

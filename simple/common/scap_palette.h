@@ -1,50 +1,86 @@
-/* scap_palette.h - fixed RGB332 palette + BGRA32->8bpp quantizer with 4x4
- * Bayer ordered dithering (replaces the legacy 240-color nearest-match LUT;
- * rationale in the 2026-07-08 research note under research/).
+/* scap_palette.h - backend selector + adapter for the 32bpp->8bpp quantizer.
+ * Consumers include only this header; it pulls in exactly one backend:
  *
- * Index layout: RRRGGGBB. Both scapenc and scapdec share this header; the
- * palette is never transmitted. The dither pattern depends only on absolute
- * frame coordinates, so the same input always yields the same output
- * (dirty-rect / tile-hash safe).
+ *   scap_332dither.h (default) - RGB332 palette + 4x4 Bayer ordered dithering
+ *   scap_256map.h              - legacy 240-color palette + nearest-match LUT
+ *                                (define SCAP_USE_256MAP below to select)
+ *
+ * Both backends provide kScapPal[256]/ScapPalEntry for the decode side.
+ * The encode side goes through the adapter below, hiding the backend
+ * difference (256map needs a 32KB LUT built once; 332 is stateless but
+ * needs absolute frame coordinates for the dither pattern):
+ *
+ *   ScapQuant q;                          - quantizer state
+ *   ScapQuantInit(&q);                    - once, before first use
+ *   idx = ScapQuantPixel(&q, px, x, y);   - BGRA32 pixel at frame coords
+ *   ScapQuantRect(&q, src, stride, dst, w, h, x0, y0);
+ *                                         - whole rect at frame coords (x0,y0);
+ *                                           same output as per-pixel calls but
+ *                                           takes the fast path (AVX2 on the
+ *                                           332 backend when the CPU has it)
+ *
+ * The switch lives HERE (not per-project) so scapenc and scapdec can never
+ * disagree on the palette: encoder and decoder must be built with the same
+ * backend or every decoded color is wrong.
  */
 #pragma once
-#include <stdint.h>
 
-typedef struct { uint8_t r, g, b; } ScapPalEntry;
+#define SCAP_USE_256MAP
 
-/* channel expansion: 3-bit -> 0,36,73,109,146,182,219,255; 2-bit -> 0,85,170,255 */
-#define SCAP_E3(v) (uint8_t)(((v) << 5) | ((v) << 2) | ((v) >> 1))
-#define SCAP_E2(v) (uint8_t)((v) * 0x55)
-#define SCAP_B4(r, g) \
-    { SCAP_E3(r), SCAP_E3(g), SCAP_E2(0) }, { SCAP_E3(r), SCAP_E3(g), SCAP_E2(1) }, \
-    { SCAP_E3(r), SCAP_E3(g), SCAP_E2(2) }, { SCAP_E3(r), SCAP_E3(g), SCAP_E2(3) }
-#define SCAP_G32(r) \
-    SCAP_B4(r, 0), SCAP_B4(r, 1), SCAP_B4(r, 2), SCAP_B4(r, 3), \
-    SCAP_B4(r, 4), SCAP_B4(r, 5), SCAP_B4(r, 6), SCAP_B4(r, 7)
+#ifdef SCAP_USE_256MAP
 
-static const ScapPalEntry kScapPal[256] = {
-    SCAP_G32(0), SCAP_G32(1), SCAP_G32(2), SCAP_G32(3),
-    SCAP_G32(4), SCAP_G32(5), SCAP_G32(6), SCAP_G32(7)
-};
+#include "scap_256map.h"
 
-/* 4x4 Bayer threshold map, values 0..15 */
-static const uint8_t kScapBayer[4][4] = {
-    {  0,  8,  2, 10 },
-    { 12,  4, 14,  6 },
-    {  3, 11,  1,  9 },
-    { 15,  7, 13,  5 },
-};
+typedef struct { uint8_t lut[32768]; } ScapQuant;
 
-/* BGRA32 pixel (bytes B,G,R,A) at absolute frame coords (x,y) -> RGB332
- * index. Ordered dither: add the Bayer offset scaled to the channel's
- * quantization step (32 for R/G, 64 for B), clamp, then truncate to the
- * channel's top bits. */
-static __inline uint8_t ScapQuant332(const uint8_t* p, int x, int y)
+static __inline void ScapQuantInit(ScapQuant* q)
 {
-    int m = kScapBayer[y & 3][x & 3];
-    int r = p[2] + m * 2, g = p[1] + m * 2, b = p[0] + m * 4;
-    if (r > 255) r = 255;
-    if (g > 255) g = 255;
-    if (b > 255) b = 255;
-    return (uint8_t)((r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6));
+    ScapBuildLut(q->lut);
 }
+
+static __inline uint8_t ScapQuantPixel(const ScapQuant* q, const uint8_t* p,
+                                       int x, int y)
+{
+    (void)x; (void)y; /* nearest-match mapping is position-independent */
+    return q->lut[ScapC32_15(p)];
+}
+
+static __inline void ScapQuantRect(const ScapQuant* q, const uint8_t* src,
+                                   int srcStride, uint8_t* dst, int w, int h,
+                                   int x0, int y0)
+{
+    (void)x0; (void)y0;
+    for (int row = 0; row < h; ++row, src += srcStride)
+    {
+        const uint8_t* px = src;
+        for (int x = 0; x < w; ++x, px += 4)
+            *dst++ = q->lut[ScapC32_15(px)];
+    }
+}
+
+#else /* default: RGB332 + Bayer dithering */
+
+#include "scap_332dither.h"
+
+typedef struct { int avx2; } ScapQuant; /* dispatch decided once at init */
+
+static __inline void ScapQuantInit(ScapQuant* q)
+{
+    q->avx2 = ScapQuant332DetectAvx2();
+}
+
+static __inline uint8_t ScapQuantPixel(const ScapQuant* q, const uint8_t* p,
+                                       int x, int y)
+{
+    (void)q;
+    return ScapQuant332(p, x, y);
+}
+
+static __inline void ScapQuantRect(const ScapQuant* q, const uint8_t* src,
+                                   int srcStride, uint8_t* dst, int w, int h,
+                                   int x0, int y0)
+{
+    ScapQuant332Rect(src, srcStride, dst, w, h, x0, y0, q->avx2);
+}
+
+#endif

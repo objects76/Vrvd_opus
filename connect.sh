@@ -8,7 +8,9 @@ cd "$(dirname "$0")/simple/viewer"
 if [ ! -x viewer ] || [ viewer_x11.cpp -nt viewer ] \
    || [ ../common/scap_stream.h  -nt viewer ] \
    || [ ../common/scap_packet.h  -nt viewer ] \
-   || [ ../common/scap_palette.h -nt viewer ]; then
+   || [ ../common/scap_palette.h -nt viewer ] \
+   || [ ../common/scap_332dither.h -nt viewer ] \
+   || [ ../common/scap_256map.h -nt viewer ]; then
     echo "rebuilding viewer..."
     g++ -O2 -Wall -o viewer viewer_x11.cpp -lX11 -lz -lpthread
     ./viewer --selftest
