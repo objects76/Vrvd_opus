@@ -14,6 +14,7 @@
 struct ScapEnc
 {
     DxgiDup              dup;
+    ScapQuant            quant;
     std::vector<RECT>    dirty;
     std::vector<DXGI_OUTDUPL_MOVE_RECT> moves;
     std::vector<uint8_t> payload; /* move rects + rect headers + 8bpp pixels */
@@ -96,6 +97,7 @@ SCAPENC_API ScapEnc* ScapEnc_Create(void)
         delete e;
         return nullptr;
     }
+    ScapQuantInit(&e->quant);
     if (FILE* f = OpenMoveLog())
     {
         SYSTEMTIME t;
@@ -173,14 +175,11 @@ SCAPENC_API int ScapEnc_CaptureFrame(ScapEnc* e, int timeoutMs,
         uint8_t* dst = e->payload.data() + at;
         const uint8_t* src = (const uint8_t*)mapped.pData +
                              (size_t)r.top * mapped.RowPitch + (size_t)r.left * 4;
-        /* absolute frame coords keep the Bayer pattern aligned across dirty
-         * rects: unchanged pixels re-encode to the same index */
-        for (int row = 0; row < rh.h; ++row, src += mapped.RowPitch)
-        {
-            const uint8_t* px = src;
-            for (int x = 0; x < rh.w; ++x, px += 4)
-                *dst++ = ScapQuant332(px, r.left + x, r.top + row);
-        }
+        /* absolute frame coords keep the dither pattern (if the backend has
+         * one) aligned across dirty rects: unchanged pixels re-encode to the
+         * same index */
+        ScapQuantRect(&e->quant, src, (int)mapped.RowPitch, dst,
+                      rh.w, rh.h, r.left, r.top);
     }
     e->dup.Unmap();
 

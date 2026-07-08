@@ -3,7 +3,8 @@
  * Packet = ScapFrameHdr (16 bytes) + zlib blob (compress2 of the payload).
  * Payload = moveCount x ScapMoveRect
  *         + rectCount x { ScapRectHdr + w*h bytes of 8bpp palette indices },
- * row-major, no row padding. Palette is the fixed table in scap_palette.h.
+ * row-major, no row padding. Palette is the fixed table selected by
+ * scap_palette.h (scap_332dither.h by default, scap_256map.h optionally).
  *
  * Move rects are DXGI move regions forwarded as copy ops (VNC CopyRect
  * style): the decoder copies w*h pixels already on its canvas from

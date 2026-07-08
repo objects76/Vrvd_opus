@@ -10,7 +10,7 @@
 |---|---|---|
 | `scapenc` | scapenc.dll | DXGI Desktop Duplication(`IDXGIOutput1::DuplicateOutput`, BGRA32) → RGB332 + Bayer 4x4 dithering으로 8bpp 변환 → 프레임 payload 전체를 메모리에 모은 뒤 `compress2` 1회 |
 | `scapdec` | scapdec.dll | `uncompress` → rect별 8bpp DIBSection 캔버스 blit → `BitBlt` 페인트 |
-| `common` | (헤더) | wire format(`scap_packet.h`), RGB332 팔레트+dither 양자화(`scap_palette.h`, 디더 패턴은 프레임 절대좌표 고정이라 결정적 — `research/2026-07-08-32bpp_RGB_이미지를_256컬러로_변환하기.md` 참조) |
+| `common` | (헤더) | wire format(`scap_packet.h`), 양자화 어댑터(`scap_palette.h` — 사용처는 이것만 include, `ScapQuantInit`/`ScapQuantPixel` 공통 인터페이스). 백엔드 선택: 기본은 RGB332+Bayer dither(`scap_332dither.h`, 디더 패턴은 프레임 절대좌표 고정이라 결정적 — `research/2026-07-08-32bpp_RGB_이미지를_256컬러로_변환하기.md` 참조; rect 변환은 런타임 CPU 감지로 AVX2 경로 자동 사용, 미지원 CPU는 스칼라 폴백, 출력은 byte-exact 동일), `scap_palette.h`의 `SCAP_USE_256MAP`을 켜면 레거시 240색 팔레트+LUT(`scap_256map.h`) |
 | `zlib` | zlib.lib | 공식 zlib 1.3.1 소스 vendoring (compress2/uncompress에 필요한 파일만) |
 | `test` | test.exe | 루프백: 캡처→인코딩→디코딩→창 표시. 타이틀바에 fps/패킷 크기/상태 |
 | `streamserver` | streamserver.exe | 콘솔 서버: scapenc 캡처 패킷을 TCP 44300으로 스트리밍(길이 프리픽스 프레이밍). 한 번에 한 클라이언트 |
