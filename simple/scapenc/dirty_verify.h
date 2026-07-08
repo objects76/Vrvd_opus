@@ -177,24 +177,66 @@ static void ScapVerifyFrame(uint8_t* prev, int prevStride,
                     continue; /* already compared via an earlier rect */
 
                 const size_t bytes = (size_t)(x1 - bx) * SCAP_DV_BPP;
-                bool diff = false;
-                for (int y = by; y < y1 && !diff; ++y)
-                    diff = 0 != memcmp(prev + (size_t)y * prevStride + (size_t)bx * SCAP_DV_BPP,
-                                       cur + (size_t)y * curStride + (size_t)bx * SCAP_DV_BPP,
-                                       bytes);
+                int y0d = -1;
+                for (int y = by; y < y1; ++y)
+                    if (memcmp(prev + (size_t)y * prevStride + (size_t)bx * SCAP_DV_BPP,
+                               cur + (size_t)y * curStride + (size_t)bx * SCAP_DV_BPP,
+                               bytes))
+                    { y0d = y; break; }
 
                 for (int cy = c0y; cy <= c1y; ++cy)
                     for (int cx = c0x; cx <= c1x; ++cx)
-                    {
                         mark[(size_t)cy * gw + cx] = 0;
-                        if (diff)
-                            changed[(size_t)cy * gw + cx] = 1;
-                    }
-                if (diff)
-                    for (int y = by; y < y1; ++y)
-                        memcpy(prev + (size_t)y * prevStride + (size_t)bx * SCAP_DV_BPP,
-                               cur + (size_t)y * curStride + (size_t)bx * SCAP_DV_BPP,
-                               bytes);
+                if (y0d < 0)
+                    continue;
+
+                /* Changed block: shrink to the actual diff bounding box at
+                 * cell precision (TigerVNC ComparingUpdateTracker style) -
+                 * last differing row from the bottom, then left/right cell
+                 * columns scanned over the differing rows only. Rows and
+                 * columns outside the box are equal, so re-sending only the
+                 * box keeps prev == client. */
+                int y1d = y1 - 1;
+                while (y1d > y0d &&
+                       0 == memcmp(prev + (size_t)y1d * prevStride + (size_t)bx * SCAP_DV_BPP,
+                                   cur + (size_t)y1d * curStride + (size_t)bx * SCAP_DV_BPP,
+                                   bytes))
+                    --y1d;
+
+                int c0d = c0x, c1d = c1x;
+                for (; c0d < c1x; ++c0d)
+                {
+                    const int sx = c0d * SCAP_DV_CELL;
+                    const size_t sb = (size_t)(((c0d + 1) * SCAP_DV_CELL < x1)
+                                     ? SCAP_DV_CELL : x1 - sx) * SCAP_DV_BPP;
+                    bool colDiff = false;
+                    for (int y = y0d; y <= y1d && !colDiff; ++y)
+                        colDiff = 0 != memcmp(prev + (size_t)y * prevStride + (size_t)sx * SCAP_DV_BPP,
+                                              cur + (size_t)y * curStride + (size_t)sx * SCAP_DV_BPP, sb);
+                    if (colDiff) break;
+                }
+                for (; c1d > c0d; --c1d)
+                {
+                    const int sx = c1d * SCAP_DV_CELL;
+                    const size_t sb = (size_t)(((c1d + 1) * SCAP_DV_CELL < x1)
+                                     ? SCAP_DV_CELL : x1 - sx) * SCAP_DV_BPP;
+                    bool colDiff = false;
+                    for (int y = y0d; y <= y1d && !colDiff; ++y)
+                        colDiff = 0 != memcmp(prev + (size_t)y * prevStride + (size_t)sx * SCAP_DV_BPP,
+                                              cur + (size_t)y * curStride + (size_t)sx * SCAP_DV_BPP, sb);
+                    if (colDiff) break;
+                }
+
+                for (int cy = y0d / SCAP_DV_CELL; cy <= y1d / SCAP_DV_CELL; ++cy)
+                    for (int cx = c0d; cx <= c1d; ++cx)
+                        changed[(size_t)cy * gw + cx] = 1;
+
+                /* prev takes the whole block - pixels outside the box are
+                 * equal anyway, and one straight copy beats edge slicing */
+                for (int y = by; y < y1; ++y)
+                    memcpy(prev + (size_t)y * prevStride + (size_t)bx * SCAP_DV_BPP,
+                           cur + (size_t)y * curStride + (size_t)bx * SCAP_DV_BPP,
+                           bytes);
             }
         }
     }

@@ -334,6 +334,25 @@ int main()
         printf("T5 adaptive block size: OK (%lldpx)\n", (long long)rect_area(out.rects[0]));
     }
 
+    // T6: 변경 블록 bbox 축소 (TigerVNC 스타일) — 넓은 dirty rect(64px 블록)
+    // 안의 1px 변경도 8px 셀 정밀도로 좁혀져야 한다. 블록 전체 마킹이면 실패.
+    {
+        const int w = 200, h = 150, stride = w * BPP;
+        std::vector<uint8_t> prev(stride * h), cur;
+        fill_pattern(prev, stride, w, h);
+        cur = prev;
+        *px(cur, stride, 100, 100) = 0xFF654321u;   // 1px 변경
+        RECT dirtyIn[] = { { 0, 0, 200, 150 } };    // 폭 200 → 64px 블록
+        DirtyResult out;
+        ScapVerifyFrame(prev.data(), stride, cur.data(), stride, w, h,
+                        nullptr, 0, dirtyIn, 1, out.moves, out.rects);
+        assert(out.rects.size() == 1);
+        assert(rects_contain(out.rects, 100, 100));
+        assert(rect_area(out.rects[0]) <= 8 * 8);   // 블록(64x64)이 아니라 셀(8x8)
+        assert(prev == cur);
+        printf("T6 block bbox refine: OK (%lldpx)\n", (long long)rect_area(out.rects[0]));
+    }
+
     printf("all self-tests passed\n\n");
 
     // 라이브 데모: 실제 화면에서 2초간 검출
