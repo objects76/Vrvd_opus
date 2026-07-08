@@ -20,6 +20,13 @@
  * Change tracking lives in a global 8px cell grid so blocks of different
  * sizes still merge/dedup consistently (the legacy row-precision start for
  * small rects is approximated by the 8px cell granularity).
+ *
+ * Compare loops use plain CRT memcmp on purpose. Measured on a 64MB
+ * DRAM-bound working set (2026-07): CRT memcmp ~9.3GB/s at 256B rows vs
+ * ~10.6GB/s for hand-written AVX2 - the loop is memory-bandwidth-bound, so
+ * custom SIMD buys <15%. /arch:AVX2 does NOT speed memcmp up (the CRT is a
+ * prebuilt lib) and would break the encoder's deliberate runtime AVX2
+ * dispatch (scap_332dither.h) on pre-Haswell CPUs. Keep /O2, no /arch.
  */
 #pragma once
 #include <windows.h>
