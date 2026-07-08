@@ -109,8 +109,8 @@ SCAPDEC_API int ScapDec_DecodePacket(ScapDec* d, const void* packet,
 
     ScapFrameHdr hdr;
     memcpy(&hdr, packet, sizeof(hdr));
-    if (hdr.magic != SCAP_MAGIC || hdr.rectCount == 0 || hdr.width == 0 ||
-        hdr.height == 0)
+    if (hdr.magic != SCAP_MAGIC || hdr.rectCount + hdr.moveCount == 0 ||
+        hdr.width == 0 || hdr.height == 0)
         return -1;
 
     if (hdr.width != d->width || hdr.height != d->height)
@@ -136,6 +136,41 @@ SCAPDEC_API int ScapDec_DecodePacket(ScapDec* d, const void* packet,
     const uint8_t* end = d->raw + rawLen;
     RECT bounds;
     SetRectEmpty(&bounds);
+
+    /* Copy ops first (the DXGI/CopyRect contract: moves before dirty), in
+     * array order. src and dst may overlap (scroll), so pick the row walk
+     * direction like memmove does; within a row memmove handles overlap. */
+    for (unsigned i = 0; i < hdr.moveCount; ++i)
+    {
+        ScapMoveRect mv;
+        if (end - p < (ptrdiff_t)sizeof(mv))
+            return -4;
+        memcpy(&mv, p, sizeof(mv));
+        p += sizeof(mv);
+
+        if (mv.w == 0 || mv.h == 0 || mv.x + mv.w > d->width ||
+            mv.y + mv.h > d->height || mv.srcX + mv.w > d->width ||
+            mv.srcY + mv.h > d->height)
+            return -4;
+
+        uint8_t* src = d->bits + (size_t)mv.srcY * d->scan + mv.srcX;
+        uint8_t* dst = d->bits + (size_t)mv.y * d->scan + mv.x;
+        if (mv.y > mv.srcY) /* downward move: walk rows bottom-up */
+        {
+            src += (size_t)(mv.h - 1) * d->scan;
+            dst += (size_t)(mv.h - 1) * d->scan;
+            for (int row = 0; row < mv.h; ++row, src -= d->scan, dst -= d->scan)
+                memmove(dst, src, mv.w);
+        }
+        else
+        {
+            for (int row = 0; row < mv.h; ++row, src += d->scan, dst += d->scan)
+                memmove(dst, src, mv.w);
+        }
+
+        RECT r = { mv.x, mv.y, mv.x + mv.w, mv.y + mv.h };
+        UnionRect(&bounds, &bounds, &r);
+    }
 
     for (unsigned i = 0; i < hdr.rectCount; ++i)
     {

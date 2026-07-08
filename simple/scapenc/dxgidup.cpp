@@ -97,9 +97,11 @@ bool DxgiDup::RecreateDuplication()
     return true;
 }
 
-DxgiDup::AcquireResult DxgiDup::Acquire(int timeoutMs, std::vector<RECT>& dirtyRects)
+DxgiDup::AcquireResult DxgiDup::Acquire(int timeoutMs, std::vector<RECT>& dirtyRects,
+                                        std::vector<DXGI_OUTDUPL_MOVE_RECT>& moveRects)
 {
     dirtyRects.clear();
+    moveRects.clear();
 
     if (!dup && !RecreateDuplication())
         return AGAIN;
@@ -140,12 +142,32 @@ DxgiDup::AcquireResult DxgiDup::Acquire(int timeoutMs, std::vector<RECT>& dirtyR
         }
         else
         {
-            /* Move destinations count as dirty: we copy the whole current
-             * desktop image below, so the pixels are always fresh. */
+            /* Forward moves as copy ops (coordinates instead of pixels).
+             * src == dst "unmoved" moves (DXGI reports these occasionally)
+             * are a no-op copy - demote the destination to dirty, which is
+             * always safe because we CopyResource the full current frame.
+             * A move not fully on the desktop violates the DXGI contract
+             * ("moved to another location within the same image"); a later
+             * move could chain on its destination, so don't patch it - punt
+             * to a full frame. */
             const DXGI_OUTDUPL_MOVE_RECT* mv =
                 (const DXGI_OUTDUPL_MOVE_RECT*)metaBuf.data();
-            for (UINT i = 0; i < moveBytes / sizeof(*mv); ++i)
-                dirtyRects.push_back(mv[i].DestinationRect);
+            for (UINT i = 0; i < moveBytes / sizeof(*mv) && !fullFrame; ++i)
+            {
+                const RECT& d = mv[i].DestinationRect;
+                const POINT& s = mv[i].SourcePoint;
+                if (d.left < 0 || d.top < 0 ||
+                    d.right > width || d.bottom > height ||
+                    d.right <= d.left || d.bottom <= d.top ||
+                    s.x < 0 || s.y < 0 ||
+                    s.x + (d.right - d.left) > width ||
+                    s.y + (d.bottom - d.top) > height)
+                    fullFrame = true;
+                else if (s.x != d.left || s.y != d.top)
+                    moveRects.push_back(mv[i]);
+                else
+                    dirtyRects.push_back(d);
+            }
             const RECT* dr = (const RECT*)(metaBuf.data() + moveBytes);
             for (UINT i = 0; i < dirtyBytes / sizeof(*dr); ++i)
                 dirtyRects.push_back(dr[i]);
@@ -184,10 +206,14 @@ DxgiDup::AcquireResult DxgiDup::Acquire(int timeoutMs, std::vector<RECT>& dirtyR
             dirtyArea += (c.right - c.left) * (c.bottom - c.top);
         }
     }
-    if (fullFrame || clipped.empty() ||
+    /* ponytail: moves whose destination is later covered by dirty rects are
+     * not demoted - the decoder just overwrites; upgrade path is an
+     * overlap-area heuristic (drop move when dirty covers >~80% of it). */
+    if (fullFrame || (clipped.empty() && moveRects.empty()) ||
         dirtyArea > (long)width * height * 6 / 10)
     {
         clipped.assign(1, full);
+        moveRects.clear(); /* full pixels are coming; copies are pointless */
     }
     dirtyRects.swap(clipped);
 

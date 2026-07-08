@@ -4,8 +4,13 @@
  */
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
+#include <vector>
 #include "scapenc.h"
 #include "scapdec.h"
+#include "scap_packet.h"
+#include "scap_palette.h"
+#include "zlib.h"
 
 static ScapEnc* g_enc;
 static ScapDec* g_dec;
@@ -79,6 +84,199 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
+/* ---- packet test (`test.exe -packettest`) -------------------------------
+ * Decoder-only unit test for the wire format, especially move (copy) ops:
+ * builds packets by hand, decodes them, and compares the painted canvas
+ * against a trivially-correct reference model. No DXGI needed. */
+
+struct TestRect { ScapRectHdr h; const uint8_t* px; };
+
+static std::vector<uint8_t> BuildPacket(int w, int h,
+                                        const std::vector<ScapMoveRect>& moves,
+                                        const std::vector<TestRect>& rects)
+{
+    std::vector<uint8_t> raw;
+    for (const ScapMoveRect& m : moves)
+        raw.insert(raw.end(), (const uint8_t*)&m, (const uint8_t*)(&m + 1));
+    for (const TestRect& r : rects)
+    {
+        raw.insert(raw.end(), (const uint8_t*)&r.h, (const uint8_t*)(&r.h + 1));
+        raw.insert(raw.end(), r.px, r.px + (size_t)r.h.w * r.h.h);
+    }
+
+    uLongf zLen = compressBound((uLong)raw.size());
+    std::vector<uint8_t> pkt(sizeof(ScapFrameHdr) + zLen);
+    compress2(pkt.data() + sizeof(ScapFrameHdr), &zLen, raw.data(),
+              (uLong)raw.size(), Z_DEFAULT_COMPRESSION);
+    pkt.resize(sizeof(ScapFrameHdr) + zLen);
+
+    ScapFrameHdr hdr = {};
+    hdr.magic = SCAP_MAGIC;
+    hdr.width = (uint16_t)w;
+    hdr.height = (uint16_t)h;
+    hdr.rectCount = (uint16_t)rects.size();
+    hdr.moveCount = (uint16_t)moves.size();
+    hdr.rawSize = (uint32_t)raw.size();
+    memcpy(pkt.data(), &hdr, sizeof(hdr));
+    return pkt;
+}
+
+/* Reference model: same ops on a plain w*h index buffer. Moves copy through
+ * a temp buffer, so overlap is correct by construction. */
+static void RefMove(std::vector<uint8_t>& ref, int w, const ScapMoveRect& m)
+{
+    std::vector<uint8_t> tmp((size_t)m.w * m.h);
+    for (int row = 0; row < m.h; ++row)
+        memcpy(&tmp[(size_t)row * m.w],
+               &ref[(size_t)(m.srcY + row) * w + m.srcX], m.w);
+    for (int row = 0; row < m.h; ++row)
+        memcpy(&ref[(size_t)(m.y + row) * w + m.x],
+               &tmp[(size_t)row * m.w], m.w);
+}
+
+static void RefRect(std::vector<uint8_t>& ref, int w, const TestRect& r)
+{
+    for (int row = 0; row < r.h.h; ++row)
+        memcpy(&ref[(size_t)(r.h.y + row) * w + r.h.x],
+               r.px + (size_t)row * r.h.w, r.h.w);
+}
+
+/* Paint the decoder canvas into a 32bpp DIB and compare each pixel with the
+ * palette-expanded reference (index-level compare via GDI is not reliable:
+ * duplicate palette colors may remap). Returns 0 on match. */
+static int CompareCanvas(ScapDec* dec, const std::vector<uint8_t>& ref,
+                         int w, int h)
+{
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP dib = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &bits,
+                                   nullptr, 0);
+    if (!dib)
+        return 1;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HGDIOBJ old = SelectObject(dc, dib);
+
+    RECT full = { 0, 0, w, h };
+    int bad = ScapDec_Paint(dec, dc, 0, 0, &full) != 0;
+    GdiFlush();
+    for (int i = 0; i < w * h && !bad; ++i)
+    {
+        const uint8_t* px = (const uint8_t*)bits + (size_t)i * 4; /* BGRA */
+        const ScapPalEntry& pe = kScapPal[ref[i]];
+        bad = px[0] != pe.b || px[1] != pe.g || px[2] != pe.r;
+    }
+
+    SelectObject(dc, old);
+    DeleteDC(dc);
+    DeleteObject(dib);
+    return bad;
+}
+
+static int PacketTest(void)
+{
+    const int W = 64, H = 48;
+    ScapDec* dec = ScapDec_Create();
+    std::vector<uint8_t> ref((size_t)W * H);
+    int step = 10;
+
+    /* 1: full-frame pixel rect establishes the canvas (also the
+     * moveCount==0 legacy-format regression check). */
+    std::vector<uint8_t> pix((size_t)W * H);
+    for (int i = 0; i < W * H; ++i)
+        pix[i] = (uint8_t)(i * 7 + i / W);
+    TestRect fullRect = { { 0, 0, W, H }, pix.data() };
+    RECT bounds;
+    std::vector<uint8_t> pkt = BuildPacket(W, H, {}, { fullRect });
+    if (ScapDec_DecodePacket(dec, pkt.data(), (unsigned)pkt.size(), &bounds))
+        goto fail;
+    RefRect(ref, W, fullRect);
+    if (CompareCanvas(dec, ref, W, H))
+        goto fail;
+
+    /* 2: pure-move packet (rectCount 0) - upward overlapping scroll,
+     * exercises the top-down row walk. Bounds must be the move dest. */
+    ++step;
+    {
+        ScapMoveRect m = { 8, 13, 8, 8, 40, 24 }; /* dst.y < src.y */
+        pkt = BuildPacket(W, H, { m }, {});
+        if (ScapDec_DecodePacket(dec, pkt.data(), (unsigned)pkt.size(), &bounds))
+            goto fail;
+        RefMove(ref, W, m);
+        RECT want = { 8, 8, 48, 32 };
+        if (CompareCanvas(dec, ref, W, H) || !EqualRect(&bounds, &want))
+            goto fail;
+    }
+
+    /* 3: downward overlapping move (bottom-up row walk) + a dirty rect in
+     * the same packet; the rect must land after the move. */
+    ++step;
+    {
+        ScapMoveRect m = { 4, 4, 4, 10, 30, 20 }; /* dst.y > src.y */
+        std::vector<uint8_t> dpix((size_t)8 * 8, 200);
+        TestRect dr = { { 10, 12, 8, 8 }, dpix.data() };
+        pkt = BuildPacket(W, H, { m }, { dr });
+        if (ScapDec_DecodePacket(dec, pkt.data(), (unsigned)pkt.size(), &bounds))
+            goto fail;
+        RefMove(ref, W, m);
+        RefRect(ref, W, dr);
+        if (CompareCanvas(dec, ref, W, H))
+            goto fail;
+    }
+
+    /* 4: chained moves in one packet - the second sources the first's
+     * destination, so array order must be preserved. */
+    ++step;
+    {
+        ScapMoveRect a = { 0, 0, 32, 0, 16, 16 };
+        ScapMoveRect b = { 32, 0, 32, 16, 16, 16 };
+        pkt = BuildPacket(W, H, { a, b }, {});
+        if (ScapDec_DecodePacket(dec, pkt.data(), (unsigned)pkt.size(), &bounds))
+            goto fail;
+        RefMove(ref, W, a);
+        RefMove(ref, W, b);
+        if (CompareCanvas(dec, ref, W, H))
+            goto fail;
+    }
+
+    /* 5: out-of-bounds move must be rejected (decode error, not a crash). */
+    ++step;
+    {
+        ScapMoveRect m = { 40, 0, 50, 0, 20, 8 }; /* dst 50+20 > 64 */
+        pkt = BuildPacket(W, H, { m }, {});
+        if (ScapDec_DecodePacket(dec, pkt.data(), (unsigned)pkt.size(),
+                                 &bounds) != -4)
+            goto fail;
+        ScapMoveRect m2 = { 50, 0, 40, 0, 20, 8 }; /* src 50+20 > 64 */
+        pkt = BuildPacket(W, H, { m2 }, {});
+        if (ScapDec_DecodePacket(dec, pkt.data(), (unsigned)pkt.size(),
+                                 &bounds) != -4)
+            goto fail;
+    }
+
+    /* 6: truncated payload - header promises two moves, payload holds one. */
+    ++step;
+    {
+        ScapMoveRect m = { 0, 0, 16, 0, 8, 8 };
+        pkt = BuildPacket(W, H, { m }, {});
+        ((ScapFrameHdr*)pkt.data())->moveCount = 2;
+        if (ScapDec_DecodePacket(dec, pkt.data(), (unsigned)pkt.size(),
+                                 &bounds) != -4)
+            goto fail;
+    }
+
+    ScapDec_Destroy(dec);
+    return 0;
+fail:
+    ScapDec_Destroy(dec);
+    return step; /* 10 + failed case number */
+}
+
 /* Non-interactive check (`test.exe -selftest`): capture one frame, decode it,
  * verify sizes/bounds agree. Exit code 0 = pass. This is the smallest thing
  * that fails if the capture->encode->decode pipeline breaks. */
@@ -122,6 +320,8 @@ static int SelfTest(void)
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR lpCmdLine, int nCmdShow)
 {
+    if (strstr(lpCmdLine, "-packettest"))
+        return PacketTest();
     if (strstr(lpCmdLine, "-selftest"))
         return SelfTest();
 

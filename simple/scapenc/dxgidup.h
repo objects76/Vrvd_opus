@@ -26,11 +26,13 @@ struct DxgiDup
     bool Init();
     void Term();
 
-    /* On FRAME: dirtyRects holds clipped dirty rects (move destinations are
-     * treated as dirty - correct here because we CopyResource the full frame
-     * every time), and the staging texture holds the full desktop image.
+    /* On FRAME: moveRects holds screen-to-screen copies (apply first, in
+     * order), dirtyRects holds clipped dirty rects, and the staging texture
+     * holds the full desktop image. moveRects is empty on any full-frame
+     * fallback (then dirtyRects is one full-desktop rect).
      * Caller must call Map/Unmap around reading pixels. */
-    AcquireResult Acquire(int timeoutMs, std::vector<RECT>& dirtyRects);
+    AcquireResult Acquire(int timeoutMs, std::vector<RECT>& dirtyRects,
+                          std::vector<DXGI_OUTDUPL_MOVE_RECT>& moveRects);
 
     bool Map(D3D11_MAPPED_SUBRESOURCE* mapped);
     void Unmap();

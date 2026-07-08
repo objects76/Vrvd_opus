@@ -32,11 +32,16 @@ msbuild simple\simple.sln -p:Configuration=Release -p:Platform=x64
 
 ## 실행/검증
 
-- `test.exe` — 주모니터의 256컬러 미러 창. 창 드래그 시 잔상 없음(move rect를 dirty로
-  처리 + 매 프레임 전체 CopyResource라 stale 픽셀 없음), UAC/잠금 후 자동 복구,
-  해상도 변경 시 캔버스 재생성 확인.
+- `test.exe` — 주모니터의 256컬러 미러 창. 창 드래그 시 잔상 없음(매 프레임 전체
+  CopyResource라 stale 픽셀 없음), UAC/잠금 후 자동 복구, 해상도 변경 시 캔버스
+  재생성 확인. DXGI move rect는 픽셀 재전송 대신 copy op(VNC CopyRect 상당,
+  12바이트 좌표)로 전송되어 스크롤/창 이동 시 패킷이 크게 줄어든다 —
+  `research/2026-07-08-move-rect-packet-reduction.md` 참조.
 - `test.exe -selftest` — 비대화형 파이프라인 검증(캡처 1프레임 → 디코딩 → 크기/영역
   일치 확인). exit code 0 = 통과.
+- `test.exe -packettest` — 디코더 와이어포맷 단위 테스트(DXGI 불필요): copy op의
+  순서 보존·겹침(스크롤) 방향·dirty와의 적용 순서·경계/절단 패킷 거부를 손으로 만든
+  패킷과 레퍼런스 모델 비교로 검증. exit code 0 = 통과, 10+N = 케이스 N 실패.
 
 ### 스트리밍 (server ↔ viewer)
 

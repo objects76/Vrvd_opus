@@ -15,7 +15,8 @@ struct ScapEnc
     DxgiDup              dup;
     uint8_t              lut[32768];
     std::vector<RECT>    dirty;
-    std::vector<uint8_t> payload; /* rect headers + 8bpp pixels, whole frame */
+    std::vector<DXGI_OUTDUPL_MOVE_RECT> moves;
+    std::vector<uint8_t> payload; /* move rects + rect headers + 8bpp pixels */
     std::vector<uint8_t> packet;  /* ScapFrameHdr + compress2 blob */
 };
 
@@ -56,7 +57,7 @@ SCAPENC_API int ScapEnc_CaptureFrame(ScapEnc* e, int timeoutMs,
     if (!e || !packet || !size)
         return SCAPENC_ERR;
 
-    switch (e->dup.Acquire(timeoutMs, e->dirty))
+    switch (e->dup.Acquire(timeoutMs, e->dirty, e->moves))
     {
     case DxgiDup::FRAME:    break;
     case DxgiDup::TIMEOUT:  return SCAPENC_TIMEOUT;
@@ -72,6 +73,19 @@ SCAPENC_API int ScapEnc_CaptureFrame(ScapEnc* e, int timeoutMs,
     /* Accumulate the whole frame's payload in memory, compress once at the
      * end (one-shot compress2 style, per project requirement). */
     e->payload.clear();
+    for (const DXGI_OUTDUPL_MOVE_RECT& m : e->moves)
+    {
+        ScapMoveRect mv = { (uint16_t)m.SourcePoint.x,
+                            (uint16_t)m.SourcePoint.y,
+                            (uint16_t)m.DestinationRect.left,
+                            (uint16_t)m.DestinationRect.top,
+                            (uint16_t)(m.DestinationRect.right -
+                                       m.DestinationRect.left),
+                            (uint16_t)(m.DestinationRect.bottom -
+                                       m.DestinationRect.top) };
+        const uint8_t* pmv = (const uint8_t*)&mv;
+        e->payload.insert(e->payload.end(), pmv, pmv + sizeof(mv));
+    }
     for (const RECT& r : e->dirty)
     {
         ScapRectHdr rh = { (uint16_t)r.left, (uint16_t)r.top,
@@ -106,6 +120,7 @@ SCAPENC_API int ScapEnc_CaptureFrame(ScapEnc* e, int timeoutMs,
     hdr.width = (uint16_t)e->dup.width;
     hdr.height = (uint16_t)e->dup.height;
     hdr.rectCount = (uint16_t)e->dirty.size();
+    hdr.moveCount = (uint16_t)e->moves.size();
     hdr.rawSize = (uint32_t)e->payload.size();
     memcpy(e->packet.data(), &hdr, sizeof(hdr));
 
