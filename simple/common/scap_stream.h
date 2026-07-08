@@ -8,15 +8,26 @@
  *     [u32 len][len bytes: the scap packet]
  *
  * len is the full packet length (ScapFrameHdr + blob), little-endian.
- * ponytail: assumes same-endian peers (both ends are Windows x86/x64, always
+ * ponytail: assumes same-endian peers (both ends are x86/x64, always
  * little-endian). A cross-endian peer would need htonl/ntohl here.
  */
 #pragma once
 #include <stdint.h>
 #include <vector>
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "Ws2_32.lib")
+#else
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+typedef int SOCKET;
+#define INVALID_SOCKET (-1)
+#define closesocket close
+#define SD_BOTH SHUT_RDWR
+#endif
 
 #define SCAP_STREAM_PORT 44300
 /* Reject absurd frame lengths before allocating: a 4K desktop at 8bpp is ~33 MB
@@ -51,12 +62,17 @@ typedef struct ScapInputMsg
 } ScapInputMsg;
 #pragma pack(pop)
 
-/* RAII Winsock startup/cleanup; declare one instance in main() before any socket. */
+/* RAII Winsock startup/cleanup; declare one instance in main() before any socket.
+ * No-op on POSIX, where sockets need no library init. */
 struct ScapNetInit
 {
     bool ok;
+#ifdef _WIN32
     ScapNetInit()  { WSADATA wd; ok = (WSAStartup(MAKEWORD(2, 2), &wd) == 0); }
     ~ScapNetInit() { if (ok) WSACleanup(); }
+#else
+    ScapNetInit() : ok(true) {}
+#endif
 };
 
 /* Blocking send/recv of an exact byte count. Return false on error or peer close. */

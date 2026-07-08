@@ -291,7 +291,7 @@ static int SelfTest(void)
     assert(d.width == 8 && d.height == 5);
     assert(d.canvas[1 * 8 + 1] == 7 && d.canvas[2 * 8 + 3] == 7); /* r1 */
     assert(d.canvas[0] == 3 && d.canvas[1] == 3);                 /* r2 */
-    assert(d.canvas[4 * 8 + 7] == 1);              /* untouched = black */
+    assert(d.canvas[4 * 8 + 7] == 0);              /* untouched = black (RGB332) */
     assert(b.x0 == 0 && b.y0 == 0 && b.x1 == 4 && b.y1 == 3);
     assert(DecodePacket(&d, pkt.data(), sizeof(hdr) - 1, &b) != 0); /* truncated */
     printf("selftest ok\n");
