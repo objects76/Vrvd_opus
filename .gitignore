@@ -1,0 +1,28 @@
+RC5XWIN/
+
+# Build output / intermediate dirs (any level)
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+[Ww]in32/
+[Xx]86/
+
+# Visual Studio local state
+.vs/
+*.user
+*.suo
+
+# Compiler / linker artifacts
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.res
+*.tlog
+*.log
