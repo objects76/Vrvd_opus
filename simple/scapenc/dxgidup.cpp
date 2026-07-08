@@ -127,9 +127,13 @@ DxgiDup::AcquireResult DxgiDup::Acquire(int timeoutMs, std::vector<RECT>& dirtyR
         return NOCHANGE;
     }
 
-    /* Collect move + dirty metadata before releasing the frame. */
+    /* Collect move + dirty metadata before releasing the frame. Metadata is
+     * fetched even on a full-frame pass so the move diagnostics count every
+     * move DXGI ever reports, including ones we then discard. */
     bool fullFrame = forceFullFrame || fi.AccumulatedFrames > 1;
-    if (!fullFrame && fi.TotalMetadataBufferSize > 0)
+    long long unmovedHere = 0;
+    lastRawMoves = 0;
+    if (fi.TotalMetadataBufferSize > 0)
     {
         metaBuf.resize(fi.TotalMetadataBufferSize);
         UINT moveBytes = 0, dirtyBytes = 0;
@@ -152,6 +156,8 @@ DxgiDup::AcquireResult DxgiDup::Acquire(int timeoutMs, std::vector<RECT>& dirtyR
              * to a full frame. */
             const DXGI_OUTDUPL_MOVE_RECT* mv =
                 (const DXGI_OUTDUPL_MOVE_RECT*)metaBuf.data();
+            lastRawMoves = (int)(moveBytes / sizeof(*mv));
+            statRawMoves += lastRawMoves;
             for (UINT i = 0; i < moveBytes / sizeof(*mv) && !fullFrame; ++i)
             {
                 const RECT& d = mv[i].DestinationRect;
@@ -166,11 +172,17 @@ DxgiDup::AcquireResult DxgiDup::Acquire(int timeoutMs, std::vector<RECT>& dirtyR
                 else if (s.x != d.left || s.y != d.top)
                     moveRects.push_back(mv[i]);
                 else
+                {
                     dirtyRects.push_back(d);
+                    ++unmovedHere;
+                }
             }
-            const RECT* dr = (const RECT*)(metaBuf.data() + moveBytes);
-            for (UINT i = 0; i < dirtyBytes / sizeof(*dr); ++i)
-                dirtyRects.push_back(dr[i]);
+            if (!fullFrame)
+            {
+                const RECT* dr = (const RECT*)(metaBuf.data() + moveBytes);
+                for (UINT i = 0; i < dirtyBytes / sizeof(*dr); ++i)
+                    dirtyRects.push_back(dr[i]);
+            }
         }
     }
     else if (!fullFrame)
@@ -216,6 +228,11 @@ DxgiDup::AcquireResult DxgiDup::Acquire(int timeoutMs, std::vector<RECT>& dirtyR
         moveRects.clear(); /* full pixels are coming; copies are pointless */
     }
     dirtyRects.swap(clipped);
+
+    ++statFrames;
+    statUnmoved += unmovedHere;
+    statForwarded += (long long)moveRects.size();
+    statDroppedFull += lastRawMoves - unmovedHere - (long long)moveRects.size();
 
     forceFullFrame = false;
     return FRAME;

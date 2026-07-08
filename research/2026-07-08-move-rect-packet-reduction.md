@@ -131,6 +131,41 @@ pixel rect 루프 전에 move를 배열 순서대로 적용:
 7. **하드웨어 비디오 인코딩 (NVENC/QSV H.264)** — 업계 방향(RDP도 AVC444 모드)이지만
    8bpp palette+zlib PoC 범위 밖. 장기 과제로만 기록.
 
+## 5. (2026-07-08 추가) move rect를 받기 위한 Desktop Duplication 설정 파라미터?
+
+**결론: 없다. 수신(캡처) 측에서 move rect 생성을 켜는 파라미터는 존재하지 않는다.**
+
+- `IDXGIOutput1::DuplicateOutput(device, &dup)` — 파라미터 없음.
+- `IDXGIOutput5::DuplicateOutput1(device, Flags, formats...)` — Flags는
+  `DXGI_OUTDUPL_FLAG` 비트필드인데, SDK 헤더(10.0.26100 / 10.0.28000 `dxgi1_5.h:93`)에
+  정의된 값은 `DXGI_OUTDUPL_COMPOSITED_UI_CAPTURE_ONLY = 1` 하나뿐(보호 콘텐츠 UI
+  캡처용). move rect와 무관.
+
+move rect는 **생산자(프레임을 그리는 쪽) 주도**로만 만들어진다:
+
+- 앱이 flip-model 스왑체인에서 `IDXGISwapChain1::Present1`에
+  `DXGI_PRESENT_PARAMETERS.pScrollRect/pScrollOffset`으로 "이 영역은 이전 프레임에서
+  스크롤됐다"고 **명시 선언**해야 OS가 그 사실을 안다. 공식 문서: *"The runtime also
+  uses the scrolled rectangle to optimize presentation in terminal server and
+  indirect display scenarios."* — 이 경로가 원격/중계 계층(move rect 포함)으로
+  전달되는 스크롤 힌트의 근원이다. DISCARD/SEQUENTIAL 스왑 이펙트에서는 지원 안 됨.
+- DWM은 픽셀 내용에서 스크롤을 **추론하지 않는다**. 따라서 Present1 스크롤 힌트를
+  주지 않는 앱(사실상 대부분 — VirtualDub 개발자 Avery Lee: "I couldn't find
+  anything that uses it yet")의 스크롤·창 이동은 dirty로만 보고된다.
+
+### 본 리포지토리 실측 (Win10 19045, 하드웨어 GPU 로컬 데스크톱)
+
+raw 메타데이터 레벨 계측(`GetFrameMoveRects`를 full-frame 여부와 무관하게 항상 호출)
+후에도: notepad 스크롤 30회 / conhost `dir /s` 연속 스크롤 / 창 25px 단위 연속 이동
+모두 **rawMoves = 0**. 이 환경에서 DXGI는 move rect를 발행하지 않는다(확정).
+move rect가 나올 개연성이 있는 환경: 터미널 서버(RDP 세션 내 캡처), indirect
+display — pScrollRect 문서가 명시한 최적화 대상 시나리오. (개연성 수준, 미실측)
+
+### 시사점
+
+copy op 인프라는 무비용이므로 유지하되, 이 환경의 실효 절감은 §4의 2·3번
+(서버측 prev frame + 타일 검증, XOR delta)에서 온다.
+
 ## Source
 
 1. [IDXGIOutputDuplication::GetFrameMoveRects — MS Learn](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgioutputduplication-getframemoverects) — move→dirty 처리 순서 규약, 버퍼 시맨틱 (공식 1차)
@@ -142,4 +177,9 @@ pixel rect 루프 전에 move를 배열 순서대로 적용:
 7. [Microsoft DXGIDesktopDuplication 샘플 DuplicationManager.cpp](https://github.com/microsoft/Windows-classic-samples/blob/main/Samples/DXGIDesktopDuplication/cpp/DuplicationManager.cpp) — 메타데이터 버퍼 처리 순서 (공식 샘플 1차)
 8. [x11vnc man page](https://linux.die.net/man/1/x11vnc) — scrollcopyrect/wirecopyrect 휴리스틱 (1차 문서)
 9. 로컬 소스: `simple/scapenc/dxgidup.cpp:128-158`, `simple/scapenc/scapenc.cpp:74-114`, `simple/scapdec/scapdec.cpp:140-159`, `simple/common/scap_packet.h`, `RC5XWIN/SCapEnc/desk/DesktopThread.cpp:475-507` (소스 1차)
-10. 미검증/추정으로 명시한 항목: Win10에서 시나리오별 move rect 발생 빈도 (공식 보장 없음, 실측 필요)
+10. Windows SDK `dxgi1_5.h:93-96` (10.0.26100/10.0.28000) — `DXGI_OUTDUPL_FLAG` 정의 확인 (1차, 소스 레벨)
+11. [DXGI_PRESENT_PARAMETERS — MS Learn](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/ns-dxgi1_2-dxgi_present_parameters) — pScrollRect의 terminal server/indirect display 최적화 명시 (공식 1차)
+12. [IDXGIOutput5::DuplicateOutput1 — MS Learn](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_5/nf-dxgi1_5-idxgioutput5-duplicateoutput1) — Flags 파라미터 시맨틱 (공식 1차)
+13. [VirtualDub: Screen recording with WDDM 1.2](https://www.virtualdub.org/blog2/entry_356.html) — scroll rect가 scroll-on-Present 대응이며 사용 앱을 못 찾았다는 실측 관찰 (평판 있는 3차)
+14. 본 리포지토리 실측 (2026-07-08): raw 계측으로 3개 시나리오 rawMoves=0 확인 — `simple/scapenc/dxgidup.cpp` 진단 카운터, `moveRect.log`
+15. 미검증/추정으로 명시한 항목: RDP 세션/indirect display에서의 move rect 발생 (개연성 있음, 미실측)

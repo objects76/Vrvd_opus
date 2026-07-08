@@ -20,6 +20,16 @@ struct DxgiDup
     bool                    forceFullFrame = true;
     std::vector<uint8_t>    metaBuf;
 
+    /* Move-rect diagnostics: how many moves DXGI reported this frame (raw)
+     * vs what happened to them. Session totals answer "does this machine
+     * ever emit move rects?" definitively. */
+    int                     lastRawMoves = 0;
+    long long               statFrames = 0;      /* FRAME results */
+    long long               statRawMoves = 0;    /* reported by DXGI */
+    long long               statForwarded = 0;   /* sent as copy ops */
+    long long               statUnmoved = 0;     /* src==dst, demoted to dirty */
+    long long               statDroppedFull = 0; /* discarded by full-frame fallback */
+
     enum AcquireResult { FRAME, TIMEOUT, NOCHANGE, AGAIN, FAIL };
 
     /* Creates the D3D11 device only; duplication is created on first Acquire. */
