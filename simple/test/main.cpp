@@ -180,6 +180,16 @@ static int CompareCanvas(ScapDec* dec, const std::vector<uint8_t>& ref,
 
 static int PacketTest(void)
 {
+    /* 0: palette/quantizer roundtrip - expanding an index through kScapPal
+     * and re-quantizing at (0,0) (Bayer offset 0) must return the same
+     * index; fails if the RGB332 pack/expand shifts ever disagree. */
+    for (int i = 0; i < 256; ++i)
+    {
+        uint8_t px[4] = { kScapPal[i].b, kScapPal[i].g, kScapPal[i].r, 0 };
+        if (ScapQuant332(px, 0, 0) != i)
+            return 10;
+    }
+
     const int W = 64, H = 48;
     ScapDec* dec = ScapDec_Create();
     std::vector<uint8_t> ref((size_t)W * H);

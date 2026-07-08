@@ -1,4 +1,4 @@
-/* scapenc.cpp - BGRA32 -> 8bpp (fixed palette LUT, legacy Trans32_8 semantics)
+/* scapenc.cpp - BGRA32 -> 8bpp (RGB332 + 4x4 Bayer ordered dithering)
  * -> whole-frame payload accumulation -> one compress2() -> packet.
  * Replaces the legacy per-tile streaming deflate (ZipEnc/ocomp_stream/rszip).
  */
@@ -14,7 +14,6 @@
 struct ScapEnc
 {
     DxgiDup              dup;
-    uint8_t              lut[32768];
     std::vector<RECT>    dirty;
     std::vector<DXGI_OUTDUPL_MOVE_RECT> moves;
     std::vector<uint8_t> payload; /* move rects + rect headers + 8bpp pixels */
@@ -97,7 +96,6 @@ SCAPENC_API ScapEnc* ScapEnc_Create(void)
         delete e;
         return nullptr;
     }
-    ScapBuildLut(e->lut);
     if (FILE* f = OpenMoveLog())
     {
         SYSTEMTIME t;
@@ -175,11 +173,13 @@ SCAPENC_API int ScapEnc_CaptureFrame(ScapEnc* e, int timeoutMs,
         uint8_t* dst = e->payload.data() + at;
         const uint8_t* src = (const uint8_t*)mapped.pData +
                              (size_t)r.top * mapped.RowPitch + (size_t)r.left * 4;
+        /* absolute frame coords keep the Bayer pattern aligned across dirty
+         * rects: unchanged pixels re-encode to the same index */
         for (int row = 0; row < rh.h; ++row, src += mapped.RowPitch)
         {
             const uint8_t* px = src;
             for (int x = 0; x < rh.w; ++x, px += 4)
-                *dst++ = e->lut[ScapC32_15(px)];
+                *dst++ = ScapQuant332(px, r.left + x, r.top + row);
         }
     }
     e->dup.Unmap();

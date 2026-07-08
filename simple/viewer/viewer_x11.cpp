@@ -83,7 +83,7 @@ static int DecodePacket(Dec* d, const void* packet, unsigned size, DirtyRect* ou
     {
         d->width = hdr.width;
         d->height = hdr.height;
-        d->canvas.assign((size_t)d->width * d->height, 1); /* index 1 = black */
+        d->canvas.assign((size_t)d->width * d->height, 0); /* RGB332 index 0 = black */
     }
 
     if (d->raw.size() < hdr.rawSize)

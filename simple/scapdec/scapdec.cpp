@@ -79,7 +79,7 @@ static int CreateCanvas(ScapDec* d, int w, int h)
     d->width = w;
     d->height = h;
     d->scan = (w + 3) & ~3;
-    memset(bits, 1, (size_t)d->scan * h); /* palette index 1 = black */
+    memset(bits, 0, (size_t)d->scan * h); /* RGB332 index 0 = black */
     return 0;
 }
 
