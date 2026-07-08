@@ -60,6 +60,7 @@
   <ItemGroup>
     <ClInclude Include="scapenc.h" />
     <ClInclude Include="dxgidup.h" />
+    <ClInclude Include="dirty_verify.h" />
     <ClInclude Include="..\common\scap_packet.h" />
     <ClInclude Include="..\common\scap_palette.h" />
     <ClInclude Include="..\common\scap_332dither.h" />

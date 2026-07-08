@@ -35,10 +35,14 @@ SCAPENC_API void     ScapEnc_Destroy(ScapEnc* e);
 SCAPENC_API int ScapEnc_GetDesktopSize(ScapEnc* e, int* w, int* h);
 
 /* Waits up to timeoutMs for a desktop update and encodes it.
- * On SCAPENC_OK, *packet/*size reference an internal buffer valid until the
- * next ScapEnc_* call on this handle. */
+ * On SCAPENC_OK, *packet and *size reference an internal buffer valid until
+ * the next ScapEnc_* call on this handle. */
 SCAPENC_API int ScapEnc_CaptureFrame(ScapEnc* e, int timeoutMs,
                                      const void** packet, unsigned* size);
+
+/* Make the next produced packet a full frame (e.g. a new viewer connected
+ * and has no canvas history). Also resets the change-verification state. */
+SCAPENC_API void ScapEnc_RequestFullFrame(ScapEnc* e);
 
 #ifdef __cplusplus
 }
