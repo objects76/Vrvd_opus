@@ -10,7 +10,7 @@
 #include "scapdec.h"
 #include "scap_packet.h"
 #include "scap_palette.h"
-#include "zlib.h"
+#include "zstd.h"
 
 static ScapEnc* g_enc;
 static ScapDec* g_dec;
@@ -91,9 +91,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 struct TestRect { ScapRectHdr h; const uint8_t* px; };
 
+/* Without zc the blob is a standalone zstd frame (one-shot ZSTD_compress);
+ * with zc it is a flushed piece of zc's continuing frame, like the real
+ * encoder produces - both must decode through the same DStream. */
 static std::vector<uint8_t> BuildPacket(int w, int h,
                                         const std::vector<ScapMoveRect>& moves,
-                                        const std::vector<TestRect>& rects)
+                                        const std::vector<TestRect>& rects,
+                                        ZSTD_CCtx* zc = nullptr)
 {
     std::vector<uint8_t> raw;
     for (const ScapMoveRect& m : moves)
@@ -104,10 +108,22 @@ static std::vector<uint8_t> BuildPacket(int w, int h,
         raw.insert(raw.end(), r.px, r.px + (size_t)r.h.w * r.h.h);
     }
 
-    uLongf zLen = compressBound((uLong)raw.size());
-    std::vector<uint8_t> pkt(sizeof(ScapFrameHdr) + zLen);
-    compress2(pkt.data() + sizeof(ScapFrameHdr), &zLen, raw.data(),
-              (uLong)raw.size(), Z_DEFAULT_COMPRESSION);
+    std::vector<uint8_t> pkt(sizeof(ScapFrameHdr) + ZSTD_compressBound(raw.size()));
+    size_t zLen;
+    if (zc)
+    {
+        ZSTD_inBuffer  in = { raw.data(), raw.size(), 0 };
+        ZSTD_outBuffer out = { pkt.data() + sizeof(ScapFrameHdr),
+                               pkt.size() - sizeof(ScapFrameHdr), 0 };
+        ZSTD_compressStream2(zc, &out, &in, ZSTD_e_flush);
+        zLen = out.pos;
+    }
+    else
+    {
+        zLen = ZSTD_compress(pkt.data() + sizeof(ScapFrameHdr),
+                             pkt.size() - sizeof(ScapFrameHdr),
+                             raw.data(), raw.size(), ZSTD_CLEVEL_DEFAULT);
+    }
     pkt.resize(sizeof(ScapFrameHdr) + zLen);
 
     ScapFrameHdr hdr = {};
@@ -301,6 +317,35 @@ static int PacketTest(void)
         ((ScapFrameHdr*)pkt.data())->moveCount = 2;
         if (ScapDec_DecodePacket(dec, pkt.data(), (unsigned)pkt.size(),
                                  &bounds) != -4)
+            goto fail;
+    }
+
+    /* 7: streaming continuation - two packets flushed from one CCtx form one
+     * continuing zstd frame (what scapenc really emits); the second decodes
+     * only if the decoder kept its DCtx and window across packets. Packet A
+     * is a full-frame rect: rejected packets (cases 5/6) legally leave
+     * partially applied moves on the canvas but not in ref, so the full
+     * rewrite re-syncs the two before the final compare. */
+    ++step;
+    {
+        ZSTD_CCtx* zc = ZSTD_createCCtx();
+        if (!zc)
+            goto fail;
+        ZSTD_CCtx_setParameter(zc, ZSTD_c_compressionLevel, ZSTD_CLEVEL_DEFAULT);
+        std::vector<uint8_t> p1((size_t)W * H, 55), p2((size_t)16 * 16, 99);
+        TestRect t1 = { { 0, 0, W, H }, p1.data() };
+        TestRect t2 = { { 16, 16, 16, 16 }, p2.data() };
+        pkt = BuildPacket(W, H, {}, { t1 }, zc);
+        std::vector<uint8_t> pktB = BuildPacket(W, H, {}, { t2 }, zc);
+        ZSTD_freeCCtx(zc);
+        if (ScapDec_DecodePacket(dec, pkt.data(), (unsigned)pkt.size(), &bounds))
+            goto fail;
+        RefRect(ref, W, t1);
+        if (ScapDec_DecodePacket(dec, pktB.data(), (unsigned)pktB.size(),
+                                 &bounds))
+            goto fail;
+        RefRect(ref, W, t2);
+        if (CompareCanvas(dec, ref, W, H))
             goto fail;
     }
 

@@ -1,13 +1,16 @@
 /* scapenc.cpp - BGRA32 -> 8bpp (RGB332 + 4x4 Bayer ordered dithering)
- * -> whole-frame payload accumulation -> one compress2() -> packet.
- * Replaces the legacy per-tile streaming deflate (ZipEnc/ocomp_stream/rszip).
+ * -> whole-frame payload accumulation -> zstd streaming flush -> packet.
+ * One ZSTD_CCtx lives as long as the encoder; each frame is compressed with
+ * ZSTD_e_flush so the stream continues across packets and later frames
+ * reference earlier ones as history (see scap_packet.h). Level 3 =
+ * ZSTD_CLEVEL_DEFAULT. Replaced zlib compress2 (one-shot, no history).
  */
 #include "scapenc.h"
 #include "dxgidup.h"
 #include "dirty_verify.h"
 #include "../common/scap_packet.h"
 #include "../common/scap_palette.h"
-#include "zlib.h"
+#include "zstd.h"
 #include <stdio.h>
 #include <string.h>
 #include <vector>
@@ -23,14 +26,15 @@ struct ScapEnc
     std::vector<RECT>    vDirty;  /* ScapVerifyFrame output scratch */
     std::vector<DXGI_OUTDUPL_MOVE_RECT> vMoves;
     std::vector<uint8_t> payload; /* move rects + rect headers + 8bpp pixels */
-    std::vector<uint8_t> packet;  /* ScapFrameHdr + compress2 blob */
+    std::vector<uint8_t> packet;  /* ScapFrameHdr + zstd blob */
+    ZSTD_CCtx*           cctx = nullptr;
     unsigned             frameNo = 0;
     long long            totalMovePx = 0;
 };
 
 /* moveRect.log: per frame that carries moves, how many pixels the old
  * move-as-dirty path would have re-sent vs the 12-byte copy ops actually
- * sent. Pixel counts are pre-zlib 8bpp bytes.
+ * sent. Pixel counts are pre-compression 8bpp bytes.
  * ponytail: written to the workspace root, assumed to be 4 components above
  * the dll (simple\bin\<plat>\<cfg>); if the dll is deployed elsewhere the
  * log follows the same relative ascent. */
@@ -97,11 +101,25 @@ extern "C" {
 SCAPENC_API ScapEnc* ScapEnc_Create(void)
 {
     ScapEnc* e = new ScapEnc();
-    if (!e->dup.Init())
+    e->cctx = ZSTD_createCCtx();
+    if (!e->cctx || !e->dup.Init())
     {
+        ZSTD_freeCCtx(e->cctx);
         delete e;
         return nullptr;
     }
+    ZSTD_CCtx_setParameter(e->cctx, ZSTD_c_compressionLevel, ZSTD_CLEVEL_DEFAULT);
+    /* windowLog 21 = 2MiB history ~= one FHD 8bpp frame: the previous frame
+     * acts as the dictionary for the next one, which is where the streaming
+     * gain comes from. LDM stays off on the level-3 realtime path. Bump to
+     * 23 for 4K targets (decoders already accept up to windowLogMax 24).
+     * Buffering note: input is the whole frame payload and output is one
+     * ZSTD_compressBound-sized buffer on purpose - the 128KiB-in/32-64KiB-out
+     * chunking advice applies to socket-sink pipelines; our length-prefixed
+     * packets need the complete blob before sending, so chunking would only
+     * add loop iterations. See research/zstd_stream.hpp and
+     * research/2026-07-08-Zstd_compression_ratio_and_speed_comparison.md. */
+    ZSTD_CCtx_setParameter(e->cctx, ZSTD_c_windowLog, 21);
     ScapQuantInit(&e->quant);
     if (FILE* f = OpenMoveLog())
     {
@@ -120,6 +138,7 @@ SCAPENC_API void ScapEnc_Destroy(ScapEnc* e)
         return;
     LogSessionSummary(e);
     e->dup.Term();
+    ZSTD_freeCCtx(e->cctx);
     delete e;
 }
 
@@ -129,6 +148,10 @@ SCAPENC_API void ScapEnc_RequestFullFrame(ScapEnc* e)
         return;
     e->dup.forceFullFrame = true;
     e->prevValid = false; /* reseed prev so the full frame is sent as pixels */
+    /* New viewer = fresh ZSTD_DStream on the other end: end the current zstd
+     * frame and start a new one so its first packet is a frame boundary.
+     * Parameters (level) survive a session-only reset. */
+    ZSTD_CCtx_reset(e->cctx, ZSTD_reset_session_only);
 }
 
 SCAPENC_API int ScapEnc_GetDesktopSize(ScapEnc* e, int* w, int* h)
@@ -189,7 +212,7 @@ SCAPENC_API int ScapEnc_CaptureFrame(ScapEnc* e, int timeoutMs,
     }
 
     /* Accumulate the whole frame's payload in memory, compress once at the
-     * end (one-shot compress2 style, per project requirement). */
+     * end with a single streaming flush. */
     e->payload.clear();
     for (const DXGI_OUTDUPL_MOVE_RECT& m : e->moves)
     {
@@ -225,12 +248,33 @@ SCAPENC_API int ScapEnc_CaptureFrame(ScapEnc* e, int timeoutMs,
     }
     e->dup.Unmap();
 
-    uLongf zLen = compressBound((uLong)e->payload.size());
-    e->packet.resize(sizeof(ScapFrameHdr) + zLen);
-    if (compress2(e->packet.data() + sizeof(ScapFrameHdr), &zLen,
-                  e->payload.data(), (uLong)e->payload.size(),
-                  Z_DEFAULT_COMPRESSION) != Z_OK)
-        return SCAPENC_ERR;
+    /* ZSTD_compressBound covers the worst case for the payload plus block
+     * epilogues, so one flush call normally completes; the grow-and-retry
+     * loop is a safety net, not the expected path. */
+    size_t zCap = ZSTD_compressBound(e->payload.size());
+    e->packet.resize(sizeof(ScapFrameHdr) + zCap);
+    ZSTD_inBuffer  zin = { e->payload.data(), e->payload.size(), 0 };
+    ZSTD_outBuffer zout = { e->packet.data() + sizeof(ScapFrameHdr), zCap, 0 };
+    for (;;)
+    {
+        size_t rem = ZSTD_compressStream2(e->cctx, &zout, &zin, ZSTD_e_flush);
+        if (ZSTD_isError(rem))
+        {
+            /* The stream now holds history the client will never receive;
+             * resync by starting a new zstd frame and re-sending everything. */
+            ZSTD_CCtx_reset(e->cctx, ZSTD_reset_session_only);
+            e->dup.forceFullFrame = true;
+            e->prevValid = false;
+            return SCAPENC_ERR;
+        }
+        if (rem == 0 && zin.pos == zin.size)
+            break;
+        zCap += zCap / 2 + 64;
+        e->packet.resize(sizeof(ScapFrameHdr) + zCap);
+        zout.dst = e->packet.data() + sizeof(ScapFrameHdr);
+        zout.size = zCap;
+    }
+    size_t zLen = zout.pos;
 
     ScapFrameHdr hdr = {};
     hdr.magic = SCAP_MAGIC;

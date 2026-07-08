@@ -1,7 +1,18 @@
 /* scap_packet.h - wire format shared by scapenc/scapdec.
  *
- * Packet = ScapFrameHdr (16 bytes) + zlib blob (compress2 of the payload).
- * Payload = moveCount x ScapMoveRect
+ * Packet = ScapFrameHdr (16 bytes) + zstd blob.
+ * The encoder compresses with one long-lived zstd stream (level 3,
+ * ZSTD_CLEVEL_DEFAULT) and flushes per packet (ZSTD_e_flush), so later
+ * packets reference earlier frames' payload as history - unchanged screen
+ * content re-sent across frames compresses to almost nothing. Consequence:
+ * packets are NOT independently decodable; the decoder feeds them in order
+ * into one ZSTD_DStream. The encoder starts a new zstd frame (session
+ * reset) on ScapEnc_RequestFullFrame(), which the server calls per new
+ * connection, so a fresh decoder always starts at a frame boundary.
+ * A blob may also be a complete standalone zstd frame (one-shot
+ * ZSTD_compress); ZSTD_decompressStream handles both transparently.
+ *
+ * Payload (after decompression) = moveCount x ScapMoveRect
  *         + rectCount x { ScapRectHdr + w*h bytes of 8bpp palette indices },
  * row-major, no row padding. Palette is the fixed table selected by
  * scap_palette.h (scap_332dither.h by default, scap_256map.h optionally).
@@ -15,7 +26,7 @@
 #pragma once
 #include <stdint.h>
 
-#define SCAP_MAGIC 0x31504353u /* 'S','C','P','1' little-endian */
+#define SCAP_MAGIC 0x32504353u /* 'S','C','P','2' little-endian; 1 was zlib */
 
 #pragma pack(push, 1)
 typedef struct ScapFrameHdr
@@ -25,7 +36,7 @@ typedef struct ScapFrameHdr
     uint16_t height;    /* desktop height in px */
     uint16_t rectCount; /* pixel rects; rectCount + moveCount >= 1 */
     uint16_t moveCount; /* copy ops (was reserved/0, so old packets decode) */
-    uint32_t rawSize;   /* payload byte length after uncompress */
+    uint32_t rawSize;   /* payload byte length after decompression */
 } ScapFrameHdr;
 
 typedef struct ScapRectHdr

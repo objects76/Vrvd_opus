@@ -39,7 +39,7 @@
   <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
-      <AdditionalIncludeDirectories>..\common;..\zlib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>..\common;..\zstd-v1.5.7-win64\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>SCAPENC_EXPORTS;WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary Condition="'$(Configuration)'=='Debug'">MultiThreadedDebug</RuntimeLibrary>
       <RuntimeLibrary Condition="'$(Configuration)'=='Release'">MultiThreaded</RuntimeLibrary>
@@ -50,8 +50,13 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>..\zstd-v1.5.7-win64\dll;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;user32.lib;libzstd.dll.a;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <PostBuildEvent>
+      <Command>xcopy /D /Y "$(ProjectDir)..\zstd-v1.5.7-win64\dll\libzstd.dll" "$(OutDir)"</Command>
+      <Message>Deploy libzstd.dll next to the binaries</Message>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="scapenc.cpp" />
@@ -66,11 +71,6 @@
     <ClInclude Include="..\common\scap_palette.h" />
     <ClInclude Include="..\common\scap_332dither.h" />
     <ClInclude Include="..\common\scap_256map.h" />
-  </ItemGroup>
-  <ItemGroup>
-    <ProjectReference Include="..\zlib\zlib.vcxproj">
-      <Project>{A1B2C3D4-0001-4000-8000-000000000001}</Project>
-    </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

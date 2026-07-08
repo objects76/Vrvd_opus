@@ -1,6 +1,6 @@
 /* scap_stream.h - length-prefixed TCP framing shared by streamserver/viewer.
  *
- * A scap packet (ScapFrameHdr + zlib blob, see scap_packet.h) is self-describing
+ * A scap packet (ScapFrameHdr + zstd blob, see scap_packet.h) is self-describing
  * for *decoding* but not for *reading off a stream*: the header carries the
  * uncompressed rawSize, never the on-wire (compressed) length. So each packet is
  * framed on the wire as:

@@ -1,4 +1,4 @@
-/* scapenc.h - minimal Desktop Duplication -> 256-color -> zlib encoder
+/* scapenc.h - minimal Desktop Duplication -> 256-color -> zstd encoder
  * (ZipEnc-only PoC). Caller-polled, no internal threads.
  * Single-threaded: call all functions from one thread.
  */

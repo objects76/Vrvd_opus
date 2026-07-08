@@ -12,7 +12,7 @@ if [ ! -x viewer ] || [ viewer_x11.cpp -nt viewer ] \
    || [ ../common/scap_332dither.h -nt viewer ] \
    || [ ../common/scap_256map.h -nt viewer ]; then
     echo "rebuilding viewer..."
-    g++ -O2 -Wall -o viewer viewer_x11.cpp -lX11 -lz -lpthread
+    g++ -O2 -Wall -o viewer viewer_x11.cpp -lX11 -lzstd -lpthread
     ./viewer --selftest
 fi
 

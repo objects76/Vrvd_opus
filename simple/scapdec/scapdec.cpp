@@ -1,11 +1,14 @@
-/* scapdec.cpp - uncompress + rect blit into an 8bpp DIBSection canvas.
- * Canvas handling reduced from legacy SCapDec2/Canvas.cpp (Create/UpdateRotate0);
- * zlib streaming (icomp_stream) replaced by one-shot uncompress().
+/* scapdec.cpp - zstd streaming decompress + rect blit into an 8bpp
+ * DIBSection canvas. Canvas handling reduced from legacy SCapDec2/Canvas.cpp
+ * (Create/UpdateRotate0). One ZSTD_DCtx lives as long as the decoder and
+ * packets must be fed in stream order: the encoder flushes (not ends) its
+ * zstd frame per packet, so a packet's blob can reference earlier packets'
+ * payload as history (see scap_packet.h).
  */
 #include "scapdec.h"
 #include "../common/scap_packet.h"
 #include "../common/scap_palette.h"
-#include "zlib.h"
+#include "zstd.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -17,8 +20,9 @@ struct ScapDec
     HBITMAP  dib = nullptr;
     HGDIOBJ  oldBmp = nullptr;
     uint8_t* bits = nullptr;    /* DIBSection memory, top-down */
-    uint8_t* raw = nullptr;     /* uncompress scratch */
+    uint8_t* raw = nullptr;     /* decompress scratch */
     unsigned rawCap = 0;
+    ZSTD_DCtx* dctx = nullptr;
 };
 
 static void DestroyCanvas(ScapDec* d)
@@ -87,7 +91,18 @@ extern "C" {
 
 SCAPDEC_API ScapDec* ScapDec_Create(void)
 {
-    return new ScapDec();
+    ScapDec* d = new ScapDec();
+    d->dctx = ZSTD_createDCtx();
+    if (!d->dctx)
+    {
+        delete d;
+        return nullptr;
+    }
+    /* Cap hostile window demands at 16MB; headroom over the encoder's
+     * windowLog 21 (FHD) so a future 4K bump (23) needs no decoder change.
+     * Actual allocation follows the frame's declared window (~2MiB). */
+    ZSTD_DCtx_setParameter(d->dctx, ZSTD_d_windowLogMax, 24);
+    return d;
 }
 
 SCAPDEC_API void ScapDec_Destroy(ScapDec* d)
@@ -95,6 +110,7 @@ SCAPDEC_API void ScapDec_Destroy(ScapDec* d)
     if (!d)
         return;
     DestroyCanvas(d);
+    ZSTD_freeDCtx(d->dctx);
     free(d->raw);
     delete d;
 }
@@ -126,14 +142,24 @@ SCAPDEC_API int ScapDec_DecodePacket(ScapDec* d, const void* packet,
         d->rawCap = hdr.rawSize;
     }
 
-    uLongf rawLen = hdr.rawSize;
-    if (uncompress(d->raw, &rawLen, (const Bytef*)packet + sizeof(hdr),
-                   size - sizeof(hdr)) != Z_OK ||
-        rawLen != hdr.rawSize)
+    /* Streaming decode: consume the whole blob, expect exactly rawSize out.
+     * The encoder flushed, so everything it produced for this packet is
+     * decodable now; a full output buffer with input left over means the
+     * packet lies about rawSize. */
+    ZSTD_inBuffer  zin = { (const uint8_t*)packet + sizeof(hdr),
+                           size - sizeof(hdr), 0 };
+    ZSTD_outBuffer zout = { d->raw, hdr.rawSize, 0 };
+    while (zin.pos < zin.size)
+    {
+        size_t rc = ZSTD_decompressStream(d->dctx, &zout, &zin);
+        if (ZSTD_isError(rc) || (zout.pos == zout.size && zin.pos < zin.size))
+            return -3;
+    }
+    if (zout.pos != hdr.rawSize)
         return -3;
 
     const uint8_t* p = d->raw;
-    const uint8_t* end = d->raw + rawLen;
+    const uint8_t* end = d->raw + hdr.rawSize;
     RECT bounds;
     SetRectEmpty(&bounds);
 

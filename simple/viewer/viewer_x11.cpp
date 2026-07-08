@@ -4,7 +4,7 @@
  * Mouse input over the window (move, left/right down/up, wheel) is forwarded
  * to the server as fixed-size ScapInputMsg records for SendInput emulation.
  *
- * Build: g++ -O2 -o viewer viewer_x11.cpp -lX11 -lz -lpthread
+ * Build: g++ -O2 -o viewer viewer_x11.cpp -lX11 -lzstd -lpthread
  * Usage: ./viewer [host]       (host defaults to 127.0.0.1, port SCAP_STREAM_PORT)
  *        ./viewer --selftest   (headless decode check; no X, no network)
  *
@@ -29,7 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <zlib.h>
+#include <zstd.h>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -44,12 +44,20 @@ struct DirtyRect { int x0, y0, x1, y1; }; /* half-open; empty when x1<=x0 */
 static_assert(sizeof(ScapInputMsg) == 16, "ScapInputMsg wire size");
 
 /* Decoder state: scapdec.cpp's ScapDec minus the GDI objects. Stride == width
- * (no DIB 4-byte row alignment needed on a plain buffer). */
+ * (no DIB 4-byte row alignment needed on a plain buffer). The DCtx persists
+ * across packets: the server flushes one continuing zstd frame, so packets
+ * reference earlier ones as history and must be decoded in order. */
 struct Dec
 {
     int width = 0, height = 0;
     std::vector<uint8_t> canvas; /* 8bpp palette indices, top-down */
-    std::vector<uint8_t> raw;    /* uncompress scratch */
+    std::vector<uint8_t> raw;    /* decompress scratch */
+    ZSTD_DCtx* dctx = ZSTD_createDCtx();
+    /* cap window demands at 16MB: headroom over scapenc's windowLog 21 so a
+     * future 4K bump (23) needs no viewer change; allocation follows the
+     * frame's declared window (~2MiB) */
+    Dec() { if (dctx) ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, 24); }
+    ~Dec() { ZSTD_freeDCtx(dctx); }
 };
 
 static Dec           g_dec;
@@ -89,14 +97,22 @@ static int DecodePacket(Dec* d, const void* packet, unsigned size, DirtyRect* ou
     if (d->raw.size() < hdr.rawSize)
         d->raw.resize(hdr.rawSize);
 
-    uLongf rawLen = hdr.rawSize;
-    if (uncompress(d->raw.data(), &rawLen, (const Bytef*)packet + sizeof(hdr),
-                   size - sizeof(hdr)) != Z_OK ||
-        rawLen != hdr.rawSize)
+    /* Streaming decode: consume the whole blob, expect exactly rawSize out
+     * (the encoder flushed everything for this packet). */
+    ZSTD_inBuffer  zin = { (const uint8_t*)packet + sizeof(hdr),
+                           size - sizeof(hdr), 0 };
+    ZSTD_outBuffer zout = { d->raw.data(), hdr.rawSize, 0 };
+    while (zin.pos < zin.size)
+    {
+        size_t rc = ZSTD_decompressStream(d->dctx, &zout, &zin);
+        if (ZSTD_isError(rc) || (zout.pos == zout.size && zin.pos < zin.size))
+            return -3;
+    }
+    if (zout.pos != hdr.rawSize)
         return -3;
 
     const uint8_t* p = d->raw.data();
-    const uint8_t* end = p + rawLen;
+    const uint8_t* end = p + hdr.rawSize;
     DirtyRect b = { INT_MAX, INT_MAX, 0, 0 };
 
     for (unsigned i = 0; i < hdr.rectCount; ++i)
@@ -267,8 +283,10 @@ static uint64_t NowMs(void)
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* Headless check of the decode path: synthetic 2-rect packet through
- * DecodePacket, verify pixels, bounds and malformed-packet rejection. */
+/* Headless check of the decode path: two packets flushed from one streaming
+ * CCtx (packet 2 continues packet 1's zstd frame, so decoding it proves the
+ * DCtx persists across packets), verify pixels, bounds and malformed-packet
+ * rejection. */
 static int SelfTest(void)
 {
     std::vector<uint8_t> payload;
@@ -279,21 +297,36 @@ static int SelfTest(void)
     payload.insert(payload.end(), (size_t)r2.w * r2.h, 3);
 
     ScapFrameHdr hdr = { SCAP_MAGIC, 8, 5, 2, 0, (uint32_t)payload.size() };
-    std::vector<uint8_t> pkt(sizeof(hdr) + compressBound((uLong)payload.size()));
-    uLongf zlen = (uLongf)(pkt.size() - sizeof(hdr));
-    assert(compress2(pkt.data() + sizeof(hdr), &zlen, payload.data(),
-                     (uLong)payload.size(), 6) == Z_OK);
-    memcpy(pkt.data(), &hdr, sizeof(hdr));
+    ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    assert(cctx);
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, ZSTD_CLEVEL_DEFAULT);
+    auto build = [&](std::vector<uint8_t>& pkt) {
+        pkt.resize(sizeof(hdr) + ZSTD_compressBound(payload.size()));
+        ZSTD_inBuffer in = { payload.data(), payload.size(), 0 };
+        ZSTD_outBuffer out = { pkt.data() + sizeof(hdr),
+                               pkt.size() - sizeof(hdr), 0 };
+        size_t rem = ZSTD_compressStream2(cctx, &out, &in, ZSTD_e_flush);
+        assert(!ZSTD_isError(rem) && rem == 0 && in.pos == in.size);
+        memcpy(pkt.data(), &hdr, sizeof(hdr));
+        pkt.resize(sizeof(hdr) + out.pos);
+    };
+    std::vector<uint8_t> pkt1, pkt2;
+    build(pkt1);
+    build(pkt2);
+    ZSTD_freeCCtx(cctx);
 
     Dec d;
     DirtyRect b;
-    assert(DecodePacket(&d, pkt.data(), (unsigned)(sizeof(hdr) + zlen), &b) == 0);
+    assert(DecodePacket(&d, pkt1.data(), (unsigned)pkt1.size(), &b) == 0);
     assert(d.width == 8 && d.height == 5);
     assert(d.canvas[1 * 8 + 1] == 7 && d.canvas[2 * 8 + 3] == 7); /* r1 */
     assert(d.canvas[0] == 3 && d.canvas[1] == 3);                 /* r2 */
     assert(d.canvas[4 * 8 + 7] == 0);              /* untouched = black (RGB332) */
     assert(b.x0 == 0 && b.y0 == 0 && b.x1 == 4 && b.y1 == 3);
-    assert(DecodePacket(&d, pkt.data(), sizeof(hdr) - 1, &b) != 0); /* truncated */
+    /* packet 2 is mid-frame: decodable only with the same DCtx, in order */
+    assert(DecodePacket(&d, pkt2.data(), (unsigned)pkt2.size(), &b) == 0);
+    assert(d.canvas[1 * 8 + 1] == 7 && d.canvas[0] == 3);
+    assert(DecodePacket(&d, pkt1.data(), sizeof(hdr) - 1, &b) != 0); /* truncated */
     printf("selftest ok\n");
     return 0;
 }
