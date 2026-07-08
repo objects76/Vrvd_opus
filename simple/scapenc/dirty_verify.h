@@ -1,11 +1,11 @@
 /* dirty_verify.h - refine DXGI move/dirty metadata down to the pixels that
- * actually changed. Shared by scapenc (production) and the win_dirty.cpp
- * prototype at the repo root (whose self-test covers this exact code).
+ * actually changed. Used by scapenc (production); dirty_verify_test.cpp
+ * next to this header self-tests this exact code and hosts a live demo.
  *
  * Reconstruction contract (DXGI):
  *   cur == apply_dirty(apply_moves(prev, moves), dirty)
  *
- * Pipeline (from detect_dirty.md / win_dirty.cpp):
+ * Pipeline (from detect_dirty.md):
  *   1. apply move rects to prev in array order (overlap-safe via memmove)
  *   2. compare the dirty areas of prev(moved) vs cur in blocks
  *      -> over-reported dirty dies here

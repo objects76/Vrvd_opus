@@ -1,15 +1,16 @@
-// win_dirty.cpp — 화면 변경 영역(dirty rect / move rect) 검출 프로토타입.
+// dirty_verify_test.cpp — dirty_verify.h(ScapVerifyFrame) 테스트 하니스.
+// (구 win_dirty.cpp — 파이프라인 본체가 dirty_verify.h로 옮겨진 뒤 남은
+// 셀프테스트+데모를 사용처 옆으로 이동)
 //
-// 검출 파이프라인 본체는 simple/scapenc/dirty_verify.h(ScapVerifyFrame)로
-// 이동했고 scapenc이 실제로 사용한다. 이 파일은 그 코드를 그대로 include해서
-//   1) 순수 로직 셀프테스트 (T1~T4)
+//   1) 순수 로직 셀프테스트 (T1~T6) — scapenc이 쓰는 코드 그대로 검증
 //   2) DXGI Desktop Duplication 라이브 데모
-// 를 제공한다. 블록 크기는 레거시 check_changed_bits의 적응형 휴리스틱
-// (rect 폭 >=32 → 64px, 16~31 → 16px, <16 → 8px)을 쓰고, 변경 추적은
-// 8px 셀 그리드로 병합된다 — 상세는 dirty_verify.h 주석 참조.
 //
-// 빌드(셀프테스트+라이브 데모):
-//   cl /EHsc /W4 /O2 /DWIN_DIRTY_SELFTEST win_dirty.cpp d3d11.lib dxgi.lib
+// 블록 크기는 레거시 check_changed_bits의 적응형 휴리스틱
+// (rect 폭 >=32 → 64px, 16~31 → 16px, <16 → 8px), 변경 추적은 8px 셀
+// 그리드 + 블록 bbox 축소(TigerVNC 스타일) — 상세는 dirty_verify.h 주석.
+//
+// 빌드(셀프테스트+라이브 데모, scapenc.dll 빌드와 무관한 단독 실행 파일):
+//   cl /EHsc /W4 /O2 /utf-8 /DWIN_DIRTY_SELFTEST dirty_verify_test.cpp d3d11.lib dxgi.lib
 
 #include <windows.h>
 #include <d3d11.h>
@@ -17,7 +18,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <vector>
-#include "simple/scapenc/dirty_verify.h"
+#include "dirty_verify.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
