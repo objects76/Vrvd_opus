@@ -8,6 +8,7 @@ cd "$(dirname "$0")/simple/viewer"
 if [ ! -x viewer ] || [ viewer_x11.cpp -nt viewer ] \
    || [ ../common/scap_stream.h  -nt viewer ] \
    || [ ../common/scap_packet.h  -nt viewer ] \
+   || [ ../common/zstd_stream.h  -nt viewer ] \
    || [ ../common/scap_palette.h -nt viewer ] \
    || [ ../common/scap_332dither.h -nt viewer ] \
    || [ ../common/scap_256map.h -nt viewer ]; then
