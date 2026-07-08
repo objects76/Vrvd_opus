@@ -4,6 +4,7 @@
  */
 #include "scapenc.h"
 #include "dxgidup.h"
+#include "dirty_verify.h"
 #include "../common/scap_packet.h"
 #include "../common/scap_palette.h"
 #include "zlib.h"
@@ -17,6 +18,10 @@ struct ScapEnc
     ScapQuant            quant;
     std::vector<RECT>    dirty;
     std::vector<DXGI_OUTDUPL_MOVE_RECT> moves;
+    std::vector<uint8_t> prev;    /* BGRA mirror of what the client has */
+    bool                 prevValid = false;
+    std::vector<RECT>    vDirty;  /* ScapVerifyFrame output scratch */
+    std::vector<DXGI_OUTDUPL_MOVE_RECT> vMoves;
     std::vector<uint8_t> payload; /* move rects + rect headers + 8bpp pixels */
     std::vector<uint8_t> packet;  /* ScapFrameHdr + compress2 blob */
     unsigned             frameNo = 0;
@@ -118,6 +123,14 @@ SCAPENC_API void ScapEnc_Destroy(ScapEnc* e)
     delete e;
 }
 
+SCAPENC_API void ScapEnc_RequestFullFrame(ScapEnc* e)
+{
+    if (!e)
+        return;
+    e->dup.forceFullFrame = true;
+    e->prevValid = false; /* reseed prev so the full frame is sent as pixels */
+}
+
 SCAPENC_API int ScapEnc_GetDesktopSize(ScapEnc* e, int* w, int* h)
 {
     if (w) *w = e ? e->dup.width : 0;
@@ -145,6 +158,35 @@ SCAPENC_API int ScapEnc_CaptureFrame(ScapEnc* e, int timeoutMs,
     D3D11_MAPPED_SUBRESOURCE mapped;
     if (!e->dup.Map(&mapped))
         return SCAPENC_ERR;
+
+    /* Refine DXGI metadata down to the pixels that actually changed by
+     * comparing against prev (a BGRA mirror of the client's canvas). On the
+     * first frame / after ScapEnc_RequestFullFrame / on resize there is no
+     * valid prev, so send the rects as-is (a full-frame rect) and seed prev. */
+    const uint8_t* cur = (const uint8_t*)mapped.pData;
+    const int w = e->dup.width, h = e->dup.height;
+    const size_t prevStride = (size_t)w * 4;
+    if (!e->prevValid || e->prev.size() != prevStride * h)
+    {
+        e->prev.resize(prevStride * h);
+        for (int y = 0; y < h; ++y)
+            memcpy(e->prev.data() + y * prevStride, cur + (size_t)y * mapped.RowPitch,
+                   prevStride);
+        e->prevValid = true;
+    }
+    else
+    {
+        ScapVerifyFrame(e->prev.data(), (int)prevStride, cur, (int)mapped.RowPitch,
+                        w, h, e->moves.data(), (int)e->moves.size(),
+                        e->dirty.data(), (int)e->dirty.size(), e->vMoves, e->vDirty);
+        e->moves.swap(e->vMoves);
+        e->dirty.swap(e->vDirty);
+        if (e->moves.empty() && e->dirty.empty())
+        {
+            e->dup.Unmap(); /* over-reported frame: nothing really changed */
+            return SCAPENC_NOCHANGE;
+        }
+    }
 
     /* Accumulate the whole frame's payload in memory, compress once at the
      * end (one-shot compress2 style, per project requirement). */

@@ -168,6 +168,8 @@ static int RunServer(void)
         char ip[INET_ADDRSTRLEN] = {};
         inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
         printf("client connected: %s\n", ip);
+        /* the new viewer has no canvas history - start it with a full frame */
+        ScapEnc_RequestFullFrame(enc);
         Serve(enc, client);
         closesocket(client);
         printf("client disconnected\n");
