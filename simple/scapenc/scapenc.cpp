@@ -31,6 +31,7 @@ struct ScapEnc
 {
     const bool           useAv1;  /* codec chosen at Create, fixed for life */
     const bool           i444;    /* av1 only: 4:4:4 instead of 4:2:0 */
+    const bool           dither;  /* zstd only: Bayer dither the 8bpp quant */
     DxgiDup              dup;
     ScapQuant            quant;
     std::vector<RECT>    dirty;
@@ -46,33 +47,47 @@ struct ScapEnc
     unsigned             frameNo = 0;
     long long            totalMovePx = 0;
 
-    ScapEnc(bool av1On, bool i444On, int zstdLevel)
-        : useAv1(av1On), i444(i444On),
+    ScapEnc(bool av1On, bool i444On, int zstdLevel, bool ditherOn)
+        : useAv1(av1On), i444(i444On), dither(ditherOn),
           zenc{zs::CompressorOptions{zstdLevel}} {}
 };
 
 /* Parse a codec spec. Comes off the network (viewer hello), so unknown
  * codecs / out-of-range levels are rejected, not guessed. */
-static bool ParseCodec(const char* spec, bool* av1, bool* i444, int* level)
+static bool ParseCodec(const char* spec, bool* av1, bool* i444, int* level,
+                       bool* dither)
 {
     *av1 = false;
     *i444 = SCAP_AV1_I444 != 0;
     *level = ZSTD_LEVEL;
+    *dither = false;
     if (!spec || !*spec)
         spec = SCAP_CODEC_DEFAULT;
     if (strncmp(spec, "zstd", 4) == 0)
     {
+        /* ":"-separated options in any order: a number = level (1..22,
+         * 22 = ZSTD_maxCLevel()), "dither" = Bayer-dither the 8bpp quant. */
         const char* p = spec + 4;
-        if (*p == '\0')
-            return true;
-        if (*p != ':')
-            return false;
-        char* end;
-        long v = strtol(p + 1, &end, 10);
-        if (*end || v < 1 || v > 22) /* 22 = ZSTD_maxCLevel() */
-            return false;
-        *level = (int)v;
-        return true;
+        while (*p == ':')
+        {
+            ++p;
+            const char* sep = strchr(p, ':');
+            size_t n = sep ? (size_t)(sep - p) : strlen(p);
+            if (n == 6 && strncmp(p, "dither", 6) == 0)
+            {
+                *dither = true;
+            }
+            else
+            {
+                char* end;
+                long v = strtol(p, &end, 10);
+                if (end != p + n || n == 0 || v < 1 || v > 22)
+                    return false;
+                *level = (int)v;
+            }
+            p += n;
+        }
+        return *p == '\0';
     }
     if (strncmp(spec, "av1", 3) == 0)
     {
@@ -155,15 +170,15 @@ extern "C" {
 
 SCAPENC_API ScapEnc* ScapEnc_Create(const char* codec)
 {
-    bool av1, i444;
+    bool av1, i444, dither;
     int level;
-    if (!ParseCodec(codec, &av1, &i444, &level))
+    if (!ParseCodec(codec, &av1, &i444, &level, &dither))
         return nullptr;
     ScapEnc* e;
     try
     {
         /* zs::StreamCompressor ctor throws on failure */
-        e = new ScapEnc(av1, i444, level);
+        e = new ScapEnc(av1, i444, level, dither);
     }
     catch (...)
     {
@@ -174,7 +189,7 @@ SCAPENC_API ScapEnc* ScapEnc_Create(const char* codec)
         delete e;
         return nullptr;
     }
-    ScapQuantInit(&e->quant);
+    ScapQuantInit(&e->quant, e->dither);
     if (FILE* f = OpenMoveLog())
     {
         SYSTEMTIME t;

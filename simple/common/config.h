@@ -4,8 +4,9 @@
  * ScapHello (scap_stream.h) carrying a codec spec string right after
  * connect, and the server passes it to ScapEnc_Create(). Spec grammar:
  *
- *   "zstd[:level]"      8bpp palette + streaming zstd (level 1..22)
- *   "av1[:i420|:i444]"  libaom AV1 (i420 = 4:2:0 chroma, i444 = 4:4:4)
+ *   "zstd[:level][:dither]"  8bpp palette + streaming zstd (level 1..22;
+ *                            "dither" = Bayer-dither the quantization)
+ *   "av1[:i420|:i444]"       libaom AV1 (i420 = 4:2:0 chroma, i444 = 4:4:4)
  *
  * scapdec needs no spec: packets are self-describing (distinct magics
  * per codec, see scap_packet.h), so the decoder follows whatever arrives.

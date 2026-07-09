@@ -26,7 +26,8 @@ enum
     SCAPENC_ERR      = -1  /* unrecoverable (no D3D11 device etc.) */
 };
 
-/* codec: runtime encoder spec - "zstd[:level]" (level 1..22) or
+/* codec: runtime encoder spec - "zstd[:level][:dither]" (level 1..22,
+ * "dither" = Bayer-dither the 8bpp quantization; options in any order) or
  * "av1[:i420|:i444]"; NULL/"" = config.h SCAP_CODEC_DEFAULT. Returns NULL on
  * an unparseable spec or if D3D11 device creation fails. Duplication itself
  * is created lazily/recreated inside CaptureFrame (it can be temporarily

@@ -218,15 +218,17 @@ static int PacketTest(void)
 #endif
 
     /* 0b: rect quantizer (AVX2 path where the CPU has it) must match the
-     * per-pixel adapter byte-for-byte. Odd width exercises the vector tail,
-     * odd x0/y0 the Bayer phase alignment, stride > w*4 the row walk. */
+     * per-pixel adapter byte-for-byte, with dither off AND on. Odd width
+     * exercises the vector tail, odd x0/y0 the Bayer phase alignment,
+     * stride > w*4 the row walk. */
+    for (int dither = 0; dither <= 1; ++dither)
     {
         const int TW = 61, TH = 13, STRIDE = (TW + 3) * 4;
         std::vector<uint8_t> img((size_t)STRIDE * TH);
         for (size_t i = 0; i < img.size(); ++i)
             img[i] = (uint8_t)((i * 2654435761u) >> 13); /* incl. near-255 */
         ScapQuant q;
-        ScapQuantInit(&q);
+        ScapQuantInit(&q, dither);
         std::vector<uint8_t> got((size_t)TW * TH);
         ScapQuantRect(&q, img.data(), STRIDE, got.data(), TW, TH, 3, 2);
         for (int yy = 0; yy < TH; ++yy)
@@ -235,6 +237,25 @@ static int PacketTest(void)
                     ScapQuantPixel(&q, &img[(size_t)yy * STRIDE + xx * 4],
                                    3 + xx, 2 + yy))
                     return 10;
+    }
+
+    /* 0c: the dither flag must actually change index selection - sweeping a
+     * gray gradient across the 4 Bayer rows has to quantize differently with
+     * dithering on (fails if the flag is stored but ignored). */
+    {
+        ScapQuant qOff, qOn;
+        ScapQuantInit(&qOff, 0);
+        ScapQuantInit(&qOn, 1);
+        bool differs = false;
+        for (int v = 0; v < 256 && !differs; ++v)
+        {
+            uint8_t px[4] = { (uint8_t)v, (uint8_t)v, (uint8_t)v, 0 };
+            for (int y = 0; y < 4 && !differs; ++y)
+                differs = ScapQuantPixel(&qOff, px, v, y) !=
+                          ScapQuantPixel(&qOn, px, v, y);
+        }
+        if (!differs)
+            return 10;
     }
 
     const int W = 64, H = 48;
@@ -405,12 +426,15 @@ static int RoundTrip(const char* codec)
  * roundtrip must pass for every runtime codec spec. Exit code 0 = pass. */
 static int SelfTest(void)
 {
-    static const char* specs[] = { "zstd:6", "av1:i420", "av1:i444" };
+    static const char* specs[] = { "zstd:6", "zstd:6:dither", "av1:i420",
+                                   "av1:i444" };
     for (const char* spec : specs)
         if (int ret = RoundTrip(spec))
             return ret;
     /* a bad spec must be rejected, not silently defaulted */
-    if (ScapEnc_Create("mp4") != nullptr || ScapEnc_Create("zstd:99") != nullptr)
+    if (ScapEnc_Create("mp4") != nullptr ||
+        ScapEnc_Create("zstd:99") != nullptr ||
+        ScapEnc_Create("zstd:6:blur") != nullptr)
         return 5;
     return 0;
 }

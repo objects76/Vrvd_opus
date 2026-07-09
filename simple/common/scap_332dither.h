@@ -37,18 +37,23 @@ static const uint8_t kScapBayer[4][4] = {
     { 15,  7, 13,  5 },
 };
 
-/* BGRA32 pixel (bytes B,G,R,A) at absolute frame coords (x,y) -> RGB332
- * index. Ordered dither: add the Bayer offset scaled to the channel's
- * quantization step (32 for R/G, 64 for B), clamp, then truncate to the
- * channel's top bits. */
-static __inline uint8_t ScapQuant332(const uint8_t* p, int x, int y)
+/* BGRA32 pixel (bytes B,G,R,A) with an explicit threshold m (0..15) -> RGB332
+ * index: add m scaled to the channel's quantization step (32 for R/G, 64 for
+ * B), clamp, then truncate to the channel's top bits. m = 8 (half a step) is
+ * plain round-to-nearest - the no-dither mode. */
+static __inline uint8_t ScapQuant332M(const uint8_t* p, int m)
 {
-    int m = kScapBayer[y & 3][x & 3];
     int r = p[2] + m * 2, g = p[1] + m * 2, b = p[0] + m * 4;
     if (r > 255) r = 255;
     if (g > 255) g = 255;
     if (b > 255) b = 255;
     return (uint8_t)((r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6));
+}
+
+/* Ordered dither at absolute frame coords (x,y): the Bayer map drives m. */
+static __inline uint8_t ScapQuant332(const uint8_t* p, int x, int y)
+{
+    return ScapQuant332M(p, kScapBayer[y & 3][x & 3]);
 }
 
 /* ---- rect-level conversion --------------------------------------------
