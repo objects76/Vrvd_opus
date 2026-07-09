@@ -22,7 +22,7 @@
  * 1 = I444 (4:4:4, full-resolution chroma, sharper UI colors, bigger
  * packets; uses AV1 profile 1). The decoder reads the actual layout from
  * the bitstream, so it follows automatically. */
-#define SCAP_AV1_I444 0
+#define SCAP_AV1_I444 1
 #endif
 
 /* zstd path (USE_AV1=0): compression level for the encoder's long-lived
