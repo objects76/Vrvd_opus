@@ -35,20 +35,3 @@
 #define SCAP_AV1_BITRATE_KBPS 8000
 /* Nominal frame rate for rate control (frame duration = 1s/fps). */
 #define SCAP_AV1_FPS 30
-
-/* viewer_x11 (Linux) only: its inline decoder is still selected at BUILD
- * time. USE_AV1 picks which decode path is compiled in, and SCAP_CODEC_SPEC
- * is the spec it sends in its hello (it can only decode what it was built
- * for). The Windows binaries ignore USE_AV1 entirely. */
-#define USE_AV1 1
-
-#if !USE_AV1
-#define SCAP_CODEC_SPEC "zstd"
-#define SCAP_CODEC_NAME "zstd"
-#elif SCAP_AV1_I444
-#define SCAP_CODEC_SPEC "av1:i444"
-#define SCAP_CODEC_NAME "AV1/I444"
-#else
-#define SCAP_CODEC_SPEC "av1:i420"
-#define SCAP_CODEC_NAME "AV1/I420"
-#endif

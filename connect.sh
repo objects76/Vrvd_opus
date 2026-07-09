@@ -1,6 +1,7 @@
 #!/bin/sh
 # connect.sh - build (if stale) and connect the Linux viewer to the streamserver.
-# Usage: ./connect.sh [host]   (host defaults to 10.1.110.27)
+# Usage: ./connect.sh [host] [viewer args...]   (host defaults to 10.1.110.27;
+#        extra args go to the viewer, e.g. ./connect.sh 10.1.110.27 --codec=av1:i444)
 set -e
 cd "$(dirname "$0")/simple/viewer"
 
@@ -41,4 +42,6 @@ fi
 # new connection doesn't sit in the listen backlog
 pkill -x viewer 2>/dev/null && sleep 0.3 || true
 
-exec ./viewer "${1:-10.1.110.27}"
+host="${1:-10.1.110.27}"
+[ $# -gt 0 ] && shift
+exec ./viewer "$host" "$@"

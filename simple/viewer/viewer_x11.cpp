@@ -1,13 +1,22 @@
 /* viewer_x11.cpp - Linux/X11 port of viewer.cpp: connect to a streamserver,
- * receive length-prefixed scap packets, decode them (common/config.h
- * USE_AV1: dav1d into a BGRA canvas; else zstd+palette into an 8bpp canvas)
- * and paint them in an X11 window (runs under XWayland on Wayland too).
+ * receive length-prefixed scap packets, decode them and paint them in an X11
+ * window (runs under XWayland on Wayland too). Like scapdec, the codec is
+ * selected at RUNTIME by each packet's magic (scap_packet.h): zstd+palette
+ * packets blit into an 8bpp canvas, AV1 packets decode through dav1d into a
+ * BGRA canvas. --codec only chooses what the server is asked to encode with;
+ * the decoder follows whatever arrives.
  * Mouse input over the window (move, left/right down/up, wheel) is forwarded
  * to the server as fixed-size ScapInputMsg records for SendInput emulation.
  *
- * Build: g++ -O2 -I../zstd-1.5.7/lib -o viewer viewer_x11.cpp \
- *            ../zstd-1.5.7/lib/libzstd.a -lX11 -lpthread   (or just ./connect.sh)
- * Usage: ./viewer [host]       (host defaults to 127.0.0.1, port SCAP_STREAM_PORT)
+ * Build: g++ -O2 -I../dav1d/include -I../zstd-1.5.7/lib -o viewer viewer_x11.cpp \
+ *            ../zstd-1.5.7/lib/libzstd.a -lX11 -l:libdav1d.so.6 -lpthread
+ *        (or just ./connect.sh)
+ * Usage: ./viewer [host] [--addr=host[:port]] [--codec=spec]
+ *   host/--addr  default 127.0.0.1, port SCAP_STREAM_PORT (a bare token is a
+ *                host too, so "./viewer 10.1.110.27" keeps working)
+ *   --codec      default config.h SCAP_CODEC_DEFAULT; sent to the server in
+ *                the opening ScapHello, which encodes with it ("zstd[:level]",
+ *                "av1[:i420|:i444]")
  *        ./viewer --selftest   (headless decode check; no X, no network)
  *
  * Same shape as the Windows viewer: a reader thread does the blocking frame
@@ -20,8 +29,6 @@
  * Windows). Assumes a little-endian TrueColor 24/32bpp visual - true of any
  * modern x86 desktop; exotic visuals would need XVisualInfo-driven conversion.
  */
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
 #include <assert.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -38,11 +45,12 @@
 #include "../common/scap_packet.h"
 #include "../common/scap_palette.h"
 #include "../common/scap_stream.h"
-#if USE_AV1
 #include "../common/av1_decoder.h"
-#else
 #include "../common/zstd_stream.h"
-#endif
+/* X11 last: X.h #defines None (and other short names), which would break
+ * parsing zs::Flush::None in zstd_stream.h if included first. */
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
 
 struct DirtyRect { int x0, y0, x1, y1; }; /* half-open; empty when x1<=x0 */
 
@@ -50,22 +58,20 @@ struct DirtyRect { int x0, y0, x1, y1; }; /* half-open; empty when x1<=x0 */
  * a size mismatch would desync every event after the first. */
 static_assert(sizeof(ScapInputMsg) == 16, "ScapInputMsg wire size");
 
-/* Decoder state: scapdec.cpp's ScapDec minus the GDI objects. Stride ==
- * width (8bpp) / width*4 (BGRA) - no DIB row alignment on a plain buffer.
- * Either decoder persists across packets and needs them in stream order:
- * zstd packets continue one flushed frame, AV1 packets are one temporal
- * unit each but reference earlier frames. */
+/* Decoder state: scapdec.cpp's ScapDec minus the GDI objects; the canvas
+ * format follows the packets (bgra flips per magic). Stride == width (8bpp)
+ * / width*4 (BGRA) - no DIB row alignment on a plain buffer. Either decoder
+ * persists across packets and needs them in stream order: zstd packets
+ * continue one flushed frame, AV1 packets are one temporal unit each but
+ * reference earlier frames. */
 struct Dec
 {
     int width = 0, height = 0;
-#if USE_AV1
-    std::vector<uint8_t> canvas; /* BGRA32, top-down */
-    Av1Dec av1;                  /* call av1.Init() before first packet */
-#else
-    std::vector<uint8_t> canvas; /* 8bpp palette indices, top-down */
-    std::vector<uint8_t> raw;    /* decompress scratch */
+    bool bgra = false;           /* canvas format: BGRA32 (av1) vs 8bpp (zstd) */
+    std::vector<uint8_t> canvas; /* top-down */
+    std::vector<uint8_t> raw;    /* zstd decompress scratch */
     zs::StreamDecompressor zdec;
-#endif
+    Av1Dec av1;                  /* call av1.Init() before first packet */
 };
 
 static Dec           g_dec;
@@ -73,6 +79,8 @@ static std::mutex    g_lock;    /* guards g_dec + g_status (decode vs. paint) */
 static SOCKET        g_sock = INVALID_SOCKET;
 static volatile bool g_running = true;
 static const char*   g_host = "127.0.0.1";
+static int           g_port = SCAP_STREAM_PORT;
+static char          g_codec[sizeof(ScapHello::codec)] = SCAP_CODEC_DEFAULT;
 static int           g_pipe[2]; /* reader -> GUI: DirtyRect per decoded frame */
 
 /* title-bar stats (written by reader thread, read by GUI timer; benign race,
@@ -91,36 +99,41 @@ static int DecodePacket(Dec* d, const void* packet, unsigned size, DirtyRect* ou
 
     ScapFrameHdr hdr;
     memcpy(&hdr, packet, sizeof(hdr));
-#if USE_AV1
+
     /* AV1 packet: header + one temporal unit; the decoded picture is always
      * a full frame, so the dirty bounds are the whole canvas. */
-    if (hdr.magic != SCAP_MAGIC_AV1 || hdr.width == 0 || hdr.height == 0 ||
-        hdr.rawSize != size - sizeof(hdr))
-        return -1;
-
-    if (hdr.width != d->width || hdr.height != d->height)
+    if (hdr.magic == SCAP_MAGIC_AV1)
     {
-        d->width = hdr.width;
-        d->height = hdr.height;
-        d->canvas.assign((size_t)d->width * d->height * 4, 0);
+        if (hdr.width == 0 || hdr.height == 0 ||
+            hdr.rawSize != size - sizeof(hdr))
+            return -1;
+
+        if (hdr.width != d->width || hdr.height != d->height || !d->bgra)
+        {
+            d->width = hdr.width;
+            d->height = hdr.height;
+            d->bgra = true;
+            d->canvas.assign((size_t)d->width * d->height * 4, 0);
+        }
+
+        if (!d->av1.DecodeToBGRA((const uint8_t*)packet + sizeof(hdr),
+                                 size - sizeof(hdr), d->canvas.data(),
+                                 d->width * 4, d->width, d->height))
+            return -3;
+
+        *out = { 0, 0, d->width, d->height };
+        return 0;
     }
 
-    if (!d->av1.DecodeToBGRA((const uint8_t*)packet + sizeof(hdr),
-                             size - sizeof(hdr), d->canvas.data(),
-                             d->width * 4, d->width, d->height))
-        return -3;
-
-    *out = { 0, 0, d->width, d->height };
-    return 0;
-#else
-    if (hdr.magic != SCAP_MAGIC || hdr.rectCount == 0 || hdr.width == 0 ||
-        hdr.height == 0)
+    if (hdr.magic != SCAP_MAGIC || hdr.rectCount + hdr.moveCount == 0 ||
+        hdr.width == 0 || hdr.height == 0)
         return -1;
 
-    if (hdr.width != d->width || hdr.height != d->height)
+    if (hdr.width != d->width || hdr.height != d->height || d->bgra)
     {
         d->width = hdr.width;
         d->height = hdr.height;
+        d->bgra = false;
         d->canvas.assign((size_t)d->width * d->height, 0); /* RGB332 index 0 = black */
     }
 
@@ -157,6 +170,43 @@ static int DecodePacket(Dec* d, const void* packet, unsigned size, DirtyRect* ou
     const uint8_t* end = p + hdr.rawSize;
     DirtyRect b = { INT_MAX, INT_MAX, 0, 0 };
 
+    /* Copy ops first (the DXGI/CopyRect contract: moves before dirty), in
+     * array order. src and dst may overlap (scroll), so pick the row walk
+     * direction like memmove does; within a row memmove handles overlap. */
+    for (unsigned i = 0; i < hdr.moveCount; ++i)
+    {
+        ScapMoveRect mv;
+        if (end - p < (ptrdiff_t)sizeof(mv))
+            return -4;
+        memcpy(&mv, p, sizeof(mv));
+        p += sizeof(mv);
+
+        if (mv.w == 0 || mv.h == 0 || mv.x + mv.w > d->width ||
+            mv.y + mv.h > d->height || mv.srcX + mv.w > d->width ||
+            mv.srcY + mv.h > d->height)
+            return -4;
+
+        uint8_t* src = d->canvas.data() + (size_t)mv.srcY * d->width + mv.srcX;
+        uint8_t* dst = d->canvas.data() + (size_t)mv.y * d->width + mv.x;
+        if (mv.y > mv.srcY) /* downward move: walk rows bottom-up */
+        {
+            src += (size_t)(mv.h - 1) * d->width;
+            dst += (size_t)(mv.h - 1) * d->width;
+            for (int row = 0; row < mv.h; ++row, src -= d->width, dst -= d->width)
+                memmove(dst, src, mv.w);
+        }
+        else
+        {
+            for (int row = 0; row < mv.h; ++row, src += d->width, dst += d->width)
+                memmove(dst, src, mv.w);
+        }
+
+        if (mv.x < b.x0) b.x0 = mv.x;
+        if (mv.y < b.y0) b.y0 = mv.y;
+        if (mv.x + mv.w > b.x1) b.x1 = mv.x + mv.w;
+        if (mv.y + mv.h > b.y1) b.y1 = mv.y + mv.h;
+    }
+
     for (unsigned i = 0; i < hdr.rectCount; ++i)
     {
         ScapRectHdr rc;
@@ -182,7 +232,6 @@ static int DecodePacket(Dec* d, const void* packet, unsigned size, DirtyRect* ou
 
     *out = b;
     return 0;
-#endif /* USE_AV1 */
 }
 
 static SOCKET ConnectTo(const char* host, int port)
@@ -217,17 +266,16 @@ static void SetStatus(const char* s)
 
 static void ReaderThread(void)
 {
-    g_sock = ConnectTo(g_host, SCAP_STREAM_PORT);
+    g_sock = ConnectTo(g_host, g_port);
     if (g_sock == INVALID_SOCKET)
     {
         SetStatus("connect failed");
         return;
     }
-    /* First bytes on the wire: ask the server for the codec this build can
-     * decode (the inline decoder is compile-time, config.h USE_AV1). */
+    /* First bytes on the wire: tell the server which codec to encode with. */
     ScapHello hello = {};
     hello.magic = SCAP_HELLO_MAGIC;
-    snprintf(hello.codec, sizeof(hello.codec), "%s", SCAP_CODEC_SPEC);
+    snprintf(hello.codec, sizeof(hello.codec), "%s", g_codec);
     if (!ScapSendAll(g_sock, &hello, sizeof(hello)))
     {
         SetStatus("hello send failed");
@@ -304,27 +352,31 @@ static void PaintRect(Display* dpy, Window win, GC gc,
     uint32_t* buf = (uint32_t*)malloc((size_t)w * h * 4);
     if (!buf)
         return;
-#if USE_AV1
-    /* canvas is already BGRA bytes = 0xAARRGGBB little-endian words, exactly
-     * what a ZPixmap on a LE TrueColor visual wants: straight row copies. */
-    for (int row = 0; row < h; ++row)
-        memcpy(buf + (size_t)row * w,
-               g_dec.canvas.data() +
-                   ((size_t)(y0 + row) * g_dec.width + x0) * 4,
-               (size_t)w * 4);
-#else
-    for (int row = 0; row < h; ++row)
+    if (g_dec.bgra)
     {
-        const uint8_t* src = g_dec.canvas.data() +
-                             (size_t)(y0 + row) * g_dec.width + x0;
-        uint32_t* dst = buf + (size_t)row * w;
-        for (int col = 0; col < w; ++col)
+        /* canvas is already BGRA bytes = 0xAARRGGBB little-endian words,
+         * exactly what a ZPixmap on a LE TrueColor visual wants: straight
+         * row copies. */
+        for (int row = 0; row < h; ++row)
+            memcpy(buf + (size_t)row * w,
+                   g_dec.canvas.data() +
+                       ((size_t)(y0 + row) * g_dec.width + x0) * 4,
+                   (size_t)w * 4);
+    }
+    else
+    {
+        for (int row = 0; row < h; ++row)
         {
-            ScapPalEntry e = kScapPal[src[col]];
-            dst[col] = ((uint32_t)e.r << 16) | ((uint32_t)e.g << 8) | e.b;
+            const uint8_t* src = g_dec.canvas.data() +
+                                 (size_t)(y0 + row) * g_dec.width + x0;
+            uint32_t* dst = buf + (size_t)row * w;
+            for (int col = 0; col < w; ++col)
+            {
+                ScapPalEntry e = kScapPal[src[col]];
+                dst[col] = ((uint32_t)e.r << 16) | ((uint32_t)e.g << 8) | e.b;
+            }
         }
     }
-#endif
 
     int scr = DefaultScreen(dpy);
     XImage* img = XCreateImage(dpy, DefaultVisual(dpy, scr),
@@ -346,13 +398,20 @@ static uint64_t NowMs(void)
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-#if USE_AV1
-/* Headless check of the AV1 decode path: a pre-encoded 64x64 solid
- * BGRA(200,100,50) keyframe (produced by Av1Enc itself, regenerate with
- * the av1_blobgen scratch tool if the wire format ever changes) must decode
- * through dav1d into the expected color, and malformed packets must be
- * rejected. Roundtrip error of the embedded frame is <=1 per channel;
- * tolerance 8 leaves headroom for future encoder retuning. */
+/* Headless check of both decode paths and the per-packet codec dispatch.
+ *
+ * AV1: a pre-encoded 64x64 solid BGRA(200,100,50) keyframe (produced by
+ * Av1Enc itself, regenerate with the av1_blobgen scratch tool if the wire
+ * format ever changes) must decode through dav1d into the expected color.
+ * Roundtrip error of the embedded frame is <=1 per channel; tolerance 8
+ * leaves headroom for future encoder retuning.
+ *
+ * zstd: packets flushed from one zs::StreamCompressor (later packets continue
+ * the zstd frame, so decoding them proves the DCtx persists across packets),
+ * fed into the SAME Dec right after AV1 - the first one must flip the canvas
+ * back to 8bpp. Covers pixel rects, an overlapping downward move rect (fails
+ * if the row walk direction is wrong), bounds, and malformed-packet
+ * rejection. */
 static const unsigned char kAv1TestKeyframe[] = {
     18,0,10,10,0,0,0,2,175,255,154,95,32,8,50,25,
     20,0,37,0,0,0,132,1,0,2,194,23,111,41,2,38,
@@ -363,52 +422,41 @@ static int SelfTest(void)
 {
     Dec d;
     assert(d.av1.Init());
-
-    ScapFrameHdr hdr = { SCAP_MAGIC_AV1, 64, 64, 0, 0,
-                         (uint32_t)sizeof(kAv1TestKeyframe) };
-    std::vector<uint8_t> pkt(sizeof(hdr) + sizeof(kAv1TestKeyframe));
-    memcpy(pkt.data(), &hdr, sizeof(hdr));
-    memcpy(pkt.data() + sizeof(hdr), kAv1TestKeyframe,
-           sizeof(kAv1TestKeyframe));
-
     DirtyRect b;
-    assert(DecodePacket(&d, pkt.data(), (unsigned)pkt.size(), &b) == 0);
-    assert(d.width == 64 && d.height == 64);
-    assert(b.x0 == 0 && b.y0 == 0 && b.x1 == 64 && b.y1 == 64);
-    /* solid BGRA(200,100,50): check a corner and the center */
-    for (size_t at : { (size_t)0, (size_t)(32 * 64 + 32) * 4 })
-    {
-        assert(abs(d.canvas[at] - 200) <= 8);     /* B */
-        assert(abs(d.canvas[at + 1] - 100) <= 8); /* G */
-        assert(abs(d.canvas[at + 2] - 50) <= 8);  /* R */
-    }
-    /* zstd magic on an AV1 build must be rejected, not misparsed */
-    const uint32_t zstdMagic = SCAP_MAGIC;
-    memcpy(pkt.data(), &zstdMagic, sizeof(zstdMagic));
-    assert(DecodePacket(&d, pkt.data(), (unsigned)pkt.size(), &b) != 0);
-    /* truncated packet */
-    memcpy(pkt.data(), &hdr, sizeof(hdr));
-    assert(DecodePacket(&d, pkt.data(), sizeof(hdr) - 1, &b) != 0);
-    printf("selftest ok (%s)\n", SCAP_CODEC_NAME);
-    return 0;
-}
-#else
-/* Headless check of the decode path: two packets flushed from one
- * zs::StreamCompressor (packet 2 continues packet 1's zstd frame, so
- * decoding it proves the zs::StreamDecompressor persists across packets),
- * verify pixels, bounds and malformed-packet rejection. */
-static int SelfTest(void)
-{
-    std::vector<uint8_t> payload;
-    const ScapRectHdr r1 = { 1, 1, 3, 2 }, r2 = { 0, 0, 2, 1 };
-    payload.insert(payload.end(), (const uint8_t*)&r1, (const uint8_t*)(&r1 + 1));
-    payload.insert(payload.end(), (size_t)r1.w * r1.h, 7);
-    payload.insert(payload.end(), (const uint8_t*)&r2, (const uint8_t*)(&r2 + 1));
-    payload.insert(payload.end(), (size_t)r2.w * r2.h, 3);
 
-    ScapFrameHdr hdr = { SCAP_MAGIC, 8, 5, 2, 0, (uint32_t)payload.size() };
+    /* --- AV1 path --- */
+    {
+        ScapFrameHdr hdr = { SCAP_MAGIC_AV1, 64, 64, 0, 0,
+                             (uint32_t)sizeof(kAv1TestKeyframe) };
+        std::vector<uint8_t> pkt(sizeof(hdr) + sizeof(kAv1TestKeyframe));
+        memcpy(pkt.data(), &hdr, sizeof(hdr));
+        memcpy(pkt.data() + sizeof(hdr), kAv1TestKeyframe,
+               sizeof(kAv1TestKeyframe));
+
+        assert(DecodePacket(&d, pkt.data(), (unsigned)pkt.size(), &b) == 0);
+        assert(d.bgra && d.width == 64 && d.height == 64);
+        assert(b.x0 == 0 && b.y0 == 0 && b.x1 == 64 && b.y1 == 64);
+        /* solid BGRA(200,100,50): check a corner and the center */
+        for (size_t at : { (size_t)0, (size_t)(32 * 64 + 32) * 4 })
+        {
+            assert(abs(d.canvas[at] - 200) <= 8);     /* B */
+            assert(abs(d.canvas[at + 1] - 100) <= 8); /* G */
+            assert(abs(d.canvas[at + 2] - 50) <= 8);  /* R */
+        }
+        /* unknown magic must be rejected, not misparsed */
+        const uint32_t bad = 0xDEADBEEFu;
+        memcpy(pkt.data(), &bad, sizeof(bad));
+        assert(DecodePacket(&d, pkt.data(), (unsigned)pkt.size(), &b) != 0);
+        /* truncated packet */
+        memcpy(pkt.data(), &hdr, sizeof(hdr));
+        assert(DecodePacket(&d, pkt.data(), sizeof(hdr) - 1, &b) != 0);
+    }
+
+    /* --- zstd path, into the same Dec: runtime dispatch flips the canvas --- */
     zs::StreamCompressor enc;
-    auto build = [&](std::vector<uint8_t>& pkt) {
+    auto build = [&enc](const ScapFrameHdr& hdr,
+                        const std::vector<uint8_t>& payload,
+                        std::vector<uint8_t>& pkt) {
         pkt.resize(sizeof(hdr));
         enc.compressFrame(payload.data(), payload.size(),
                           [&pkt](const void* p, size_t n) {
@@ -417,42 +465,84 @@ static int SelfTest(void)
                           });
         memcpy(pkt.data(), &hdr, sizeof(hdr));
     };
-    std::vector<uint8_t> pkt1, pkt2;
-    build(pkt1);
-    build(pkt2);
 
-    Dec d;
-    DirtyRect b;
-    assert(DecodePacket(&d, pkt1.data(), (unsigned)pkt1.size(), &b) == 0);
-    assert(d.width == 8 && d.height == 5);
+    /* pkt1: two pixel rects on an 8x5 canvas */
+    std::vector<uint8_t> payload;
+    const ScapRectHdr r1 = { 1, 1, 3, 2 }, r2 = { 0, 0, 2, 1 };
+    payload.insert(payload.end(), (const uint8_t*)&r1, (const uint8_t*)(&r1 + 1));
+    payload.insert(payload.end(), (size_t)r1.w * r1.h, 7);
+    payload.insert(payload.end(), (const uint8_t*)&r2, (const uint8_t*)(&r2 + 1));
+    payload.insert(payload.end(), (size_t)r2.w * r2.h, 3);
+    ScapFrameHdr hdr1 = { SCAP_MAGIC, 8, 5, 2, 0, (uint32_t)payload.size() };
+    std::vector<uint8_t> pkt;
+    build(hdr1, payload, pkt);
+    assert(DecodePacket(&d, pkt.data(), (unsigned)pkt.size(), &b) == 0);
+    assert(!d.bgra && d.width == 8 && d.height == 5);
     assert(d.canvas[1 * 8 + 1] == 7 && d.canvas[2 * 8 + 3] == 7); /* r1 */
     assert(d.canvas[0] == 3 && d.canvas[1] == 3);                 /* r2 */
     assert(d.canvas[4 * 8 + 7] == 0);              /* untouched = black (RGB332) */
     assert(b.x0 == 0 && b.y0 == 0 && b.x1 == 4 && b.y1 == 3);
-    /* packet 2 is mid-frame: decodable only with the same DCtx, in order */
-    assert(DecodePacket(&d, pkt2.data(), (unsigned)pkt2.size(), &b) == 0);
-    assert(d.canvas[1 * 8 + 1] == 7 && d.canvas[0] == 3);
-    assert(DecodePacket(&d, pkt1.data(), sizeof(hdr) - 1, &b) != 0); /* truncated */
-    printf("selftest ok (%s)\n", SCAP_CODEC_NAME);
+
+    /* pkt2: mid-frame continuation - decodable only with the same DCtx, in
+     * order; overwrites row 1 of r1's block with 9s so the rows differ */
+    payload.clear();
+    const ScapRectHdr r3 = { 1, 1, 3, 1 };
+    payload.insert(payload.end(), (const uint8_t*)&r3, (const uint8_t*)(&r3 + 1));
+    payload.insert(payload.end(), (size_t)r3.w * r3.h, 9);
+    ScapFrameHdr hdr2 = { SCAP_MAGIC, 8, 5, 1, 0, (uint32_t)payload.size() };
+    build(hdr2, payload, pkt);
+    assert(DecodePacket(&d, pkt.data(), (unsigned)pkt.size(), &b) == 0);
+    assert(d.canvas[1 * 8 + 1] == 9 && d.canvas[2 * 8 + 1] == 7);
+
+    /* pkt3: overlapping downward move (rows 1-2 -> 2-3). A correct bottom-up
+     * walk yields row2=9,row3=7; a top-down walk would smear 9 into row 3. */
+    payload.clear();
+    const ScapMoveRect mv = { 1, 1, 1, 2, 3, 2 };
+    payload.insert(payload.end(), (const uint8_t*)&mv, (const uint8_t*)(&mv + 1));
+    ScapFrameHdr hdr3 = { SCAP_MAGIC, 8, 5, 0, 1, (uint32_t)payload.size() };
+    build(hdr3, payload, pkt);
+    assert(DecodePacket(&d, pkt.data(), (unsigned)pkt.size(), &b) == 0);
+    assert(d.canvas[2 * 8 + 1] == 9 && d.canvas[3 * 8 + 1] == 7);
+    assert(b.x0 == 1 && b.y0 == 2 && b.x1 == 4 && b.y1 == 4);
+
+    printf("selftest ok (zstd+av1 runtime dispatch)\n");
     return 0;
 }
-#endif /* USE_AV1 */
 
 int main(int argc, char** argv)
 {
-    if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
-        return SelfTest();
-    if (argc > 1)
-        g_host = argv[1];
+    /* --addr=host[:port] --codec=spec, same flags as viewer.cpp; a bare
+     * token is a host (keeps "./viewer 10.1.110.27" / connect.sh working). */
+    for (int i = 1; i < argc; ++i)
+    {
+        char* t = argv[i];
+        if (strcmp(t, "--selftest") == 0)
+            return SelfTest();
+        if (strncmp(t, "--addr=", 7) == 0 && t[7])
+        {
+            char* hp = t + 7;
+            if (char* colon = strrchr(hp, ':'))
+            {
+                *colon = '\0';
+                int port = atoi(colon + 1);
+                if (port > 0 && port < 65536)
+                    g_port = port;
+            }
+            if (*hp)
+                g_host = hp;
+        }
+        else if (strncmp(t, "--codec=", 8) == 0 && t[8])
+            snprintf(g_codec, sizeof(g_codec), "%s", t + 8);
+        else if (t[0] != '-')
+            g_host = t;
+    }
 
     signal(SIGPIPE, SIG_IGN); /* pipe/socket errors come back as EPIPE */
-#if USE_AV1
     if (!g_dec.av1.Init())
     {
         fprintf(stderr, "dav1d_open failed\n");
         return 1;
     }
-#endif
     if (pipe(g_pipe) != 0)
     {
         perror("pipe");
@@ -592,9 +682,9 @@ int main(int argc, char** argv)
             }
 
             snprintf(buf, sizeof(buf),
-                     "scap viewer [%s] - %s, %u fps, last pkt %u B, "
+                     "scap viewer [%s:%d] - %s, %u fps, last pkt %u B, "
                      "avg %u B/pkt %.1f KB/s (3s), %s",
-                     g_host, SCAP_CODEC_NAME,
+                     g_host, g_port, g_codec,
                      (unsigned)(frames * 1000 / elapsed), g_lastPktSize,
                      (unsigned)(wp ? wb / wp : 0),
                      wms ? (double)wb * 1000.0 / (double)wms / 1024.0 : 0.0,
