@@ -35,6 +35,21 @@ typedef int SOCKET;
  * or hostile length prefix from forcing a huge allocation. */
 #define SCAP_STREAM_MAX  (64u * 1024 * 1024)
 
+/* Handshake: the FIRST thing the viewer sends after connect. codec is the
+ * NUL-terminated encoder spec passed to ScapEnc_Create() on the server
+ * ("zstd:6", "av1:i420", "av1:i444", ...); empty = server default
+ * (config.h SCAP_CODEC_DEFAULT). The server rejects the connection on a bad
+ * magic or an unparseable spec - fail loudly, not garbage. */
+#define SCAP_HELLO_MAGIC 0x4F4C4853u /* 'S','H','L','O' little-endian */
+
+#pragma pack(push, 1)
+typedef struct ScapHello
+{
+    uint32_t magic;     /* SCAP_HELLO_MAGIC */
+    char     codec[28]; /* NUL-terminated codec spec; "" = server default */
+} ScapHello;
+#pragma pack(pop)
+
 /* Reverse channel: viewer -> server mouse input, emulated on the server via
  * SendInput. Fixed-size messages (no length prefix); the server reads exactly
  * sizeof(ScapInputMsg) each time. Position is normalized 0..65535 over the

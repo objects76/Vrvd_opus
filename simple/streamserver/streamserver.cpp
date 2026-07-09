@@ -148,14 +148,6 @@ static int RunServer(void)
         return 1;
     }
 
-    ScapEnc* enc = ScapEnc_Create();
-    if (!enc)
-    {
-        fprintf(stderr, "ScapEnc_Create failed (no D3D11 device?)\n");
-        closesocket(lsn);
-        return 1;
-    }
-
     printf("streamserver listening on TCP %d\n", SCAP_STREAM_PORT);
     PrintLocalAddrs(); /* show which IPs a viewer can connect to */
     for (;;)
@@ -168,14 +160,37 @@ static int RunServer(void)
         char ip[INET_ADDRSTRLEN] = {};
         inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
         printf("client connected: %s\n", ip);
-        /* the new viewer has no canvas history - start it with a full frame */
-        ScapEnc_RequestFullFrame(enc);
+
+        /* The viewer opens with a ScapHello naming the codec; the encoder is
+         * created per connection with that spec, so a fresh viewer always
+         * starts at a keyframe / full frame by construction.
+         * ponytail: the blocking hello recv lets one silent client stall the
+         * serial accept loop - same property the frame loop already has. */
+        ScapHello hello;
+        if (!ScapRecvAll(client, &hello, sizeof(hello)) ||
+            hello.magic != SCAP_HELLO_MAGIC)
+        {
+            printf("no/bad hello, dropping client\n");
+            closesocket(client);
+            continue;
+        }
+        hello.codec[sizeof(hello.codec) - 1] = '\0';
+        ScapEnc* enc = ScapEnc_Create(hello.codec);
+        if (!enc)
+        {
+            printf("bad codec spec \"%s\" (or no D3D11 device), dropping\n",
+                   hello.codec);
+            closesocket(client);
+            continue;
+        }
+        printf("codec: %s\n", hello.codec[0] ? hello.codec : "(default)");
         Serve(enc, client);
+        ScapEnc_Destroy(enc);
         closesocket(client);
         printf("client disconnected\n");
     }
 
-    /* not reached; OS reclaims enc/lsn on exit */
+    /* not reached; OS reclaims lsn on exit */
 }
 
 /* Verify the input-message -> SendInput flag mapping without injecting. */
