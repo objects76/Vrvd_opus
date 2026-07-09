@@ -4,6 +4,15 @@
 set -e
 cd "$(dirname "$0")/simple/viewer"
 
+# zstd is linked statically from the in-tree source (no libzstd-dev on this box)
+ZSTD_LIB=../zstd-1.5.7/lib
+[ -f "$ZSTD_LIB/libzstd.a" ] || make -C "$ZSTD_LIB" -j"$(nproc)" libzstd.a
+
+# dav1d (AV1 decode): headers vendored in ../dav1d/include (extracted from the
+# libdav1d-dev 1.2.1 deb — no sudo on this box); links the system runtime
+# libdav1d.so.6 (1.2.1) already installed. Self-check: simple/test/av1_check.cpp
+DAV1D_INC=../dav1d/include
+
 # rebuild when any source the binary depends on is newer than it
 if [ ! -x viewer ] || [ viewer_x11.cpp -nt viewer ] \
    || [ ../common/config.h -nt viewer ] \
@@ -13,7 +22,8 @@ if [ ! -x viewer ] || [ viewer_x11.cpp -nt viewer ] \
    || [ ../common/av1_decoder.h  -nt viewer ] \
    || [ ../common/scap_palette.h -nt viewer ] \
    || [ ../common/scap_332dither.h -nt viewer ] \
-   || [ ../common/scap_256map.h -nt viewer ]; then
+   || [ ../common/scap_256map.h -nt viewer ] \
+   || [ "$ZSTD_LIB/libzstd.a" -nt viewer ]; then
     echo "rebuilding viewer..."
     # USE_AV1 (common/config.h) decodes with dav1d; headers come from
     # libdav1d-dev (the libdav1d6 runtime alone is not enough)

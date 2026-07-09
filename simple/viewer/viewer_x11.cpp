@@ -5,9 +5,8 @@
  * Mouse input over the window (move, left/right down/up, wheel) is forwarded
  * to the server as fixed-size ScapInputMsg records for SendInput emulation.
  *
- * Build: g++ -O2 -o viewer viewer_x11.cpp -lX11 -lzstd -ldav1d -lpthread
- *        (USE_AV1=0 builds don't need -ldav1d, USE_AV1=1 builds don't need
- *         -lzstd; passing both is harmless. dav1d headers: libdav1d-dev.)
+ * Build: g++ -O2 -I../zstd-1.5.7/lib -o viewer viewer_x11.cpp \
+ *            ../zstd-1.5.7/lib/libzstd.a -lX11 -lpthread   (or just ./connect.sh)
  * Usage: ./viewer [host]       (host defaults to 127.0.0.1, port SCAP_STREAM_PORT)
  *        ./viewer --selftest   (headless decode check; no X, no network)
  *

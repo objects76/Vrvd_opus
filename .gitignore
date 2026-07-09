@@ -1,6 +1,6 @@
 RC5XWIN/
 RC5XMAC/
-
+zstd-1.5.7/
 
 # Build output / intermediate dirs (any level)
 bin/
