@@ -4,7 +4,7 @@
  * -> whole-frame payload accumulation -> one streaming zstd flush -> packet.
  * The zs::StreamCompressor (common/zstd_stream.h) lives as long as the
  * encoder, so later packets reference earlier frames as history (see
- * scap_packet.h). Level 3 = ZSTD_CLEVEL_DEFAULT. Replaced zlib compress2.
+ * scap_packet.h). Level = config.h ZSTD_LEVEL. Replaced zlib compress2.
  * zs errors are exceptions; this extern "C" boundary catches and translates.
  *
  * AV1 (USE_AV1=1): full captured frame -> Av1Enc (libaom, Chrome Remote
@@ -38,7 +38,7 @@ struct ScapEnc
     std::vector<DXGI_OUTDUPL_MOVE_RECT> vMoves;
     std::vector<uint8_t> payload; /* move rects + rect headers + 8bpp pixels */
     std::vector<uint8_t> packet;  /* ScapFrameHdr + zstd blob */
-    zs::StreamCompressor zenc;    /* level 3, one continuing frame */
+    zs::StreamCompressor zenc{zs::CompressorOptions{ZSTD_LEVEL}}; /* one continuing frame */
 #if USE_AV1
     Av1Enc               av1;     /* (re)inited on first frame / resize */
 #endif

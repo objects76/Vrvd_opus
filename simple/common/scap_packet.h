@@ -1,8 +1,8 @@
 /* scap_packet.h - wire format shared by scapenc/scapdec.
  *
  * Packet = ScapFrameHdr (16 bytes) + zstd blob.
- * The encoder compresses with one long-lived zstd stream (level 3,
- * ZSTD_CLEVEL_DEFAULT) and flushes per packet (ZSTD_e_flush), so later
+ * The encoder compresses with one long-lived zstd stream (level:
+ * config.h ZSTD_LEVEL) and flushes per packet (ZSTD_e_flush), so later
  * packets reference earlier frames' payload as history - unchanged screen
  * content re-sent across frames compresses to almost nothing. Consequence:
  * packets are NOT independently decodable; the decoder feeds them in order

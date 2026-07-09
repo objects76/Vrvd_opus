@@ -25,6 +25,11 @@
 #define SCAP_AV1_I444 0
 #endif
 
+/* zstd path (USE_AV1=0): compression level for the encoder's long-lived
+ * streaming CCtx (zs::CompressorOptions.level). Encoder-side only - the
+ * zstd format is self-describing, so the decoder needs no matching value. */
+#define ZSTD_LEVEL 6
+
 /* Human-readable codec name for title bars / logs. */
 #if !USE_AV1
 #define SCAP_CODEC_NAME "zstd"
