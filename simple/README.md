@@ -41,16 +41,22 @@ msbuild simple\simple.sln -p:Configuration=Release -p:Platform=x64
   (Chrome Remote Desktop과 동일 설정 — Chromium
   `remoting/codec/webrtc_video_encoder_av1.cc`: `AOM_USAGE_REALTIME` +
   `AV1E_SET_TUNE_CONTENT=AOM_CONTENT_SCREEN` + cpu-used 11 + CBR + zero-lag +
-  cyclic-refresh AQ, `common/av1_encoder.h`), scapdec이 dav1d로 디코딩
-  (WebRTC `dav1d_decoder.cc`처럼 `max_frame_delay=1`,
+  cyclic-refresh AQ, `common/av1_encoder.h`), scapdec·viewer_x11이 dav1d로
+  디코딩(WebRTC `dav1d_decoder.cc`처럼 `max_frame_delay=1`,
   `common/av1_decoder.h`)해 32bpp BGRA 캔버스에 그린다. dirty rect/move
   기계는 사용하지 않는다(코덱 inter prediction이 그 역할). 비트레이트는
-  `SCAP_AV1_BITRATE_KBPS`(기본 8000) 고정 CBR.
+  `SCAP_AV1_BITRATE_KBPS`(기본 8000) 고정 CBR. 크로마 서브샘플링은
+  `SCAP_AV1_I444`로 선택 — 0(기본) = I420(4:2:0, CRD/WebRTC와 동일),
+  1 = I444(4:4:4 풀해상도 크로마, profile 1, 색 경계 더 선명·패킷 커짐).
+  디코더는 비트스트림의 레이아웃을 따라가므로 양쪽 다 지원한다.
 - `USE_AV1 0`: 기존 8bpp 팔레트 + 스트리밍 zstd 경로.
 
 양단이 같은 값으로 빌드돼야 한다(매직이 달라 불일치는 디코드 거부로 드러남).
-viewer_x11(Linux)은 아직 zstd 경로만 구현 — 그쪽과 테스트할 땐 `USE_AV1 0`.
+뷰어 타이틀바에 현재 코덱("AV1/I420", "AV1/I444" 또는 "zstd")이 표시된다.
 `test.exe -packettest`는 zstd 와이어포맷 전용이라 `USE_AV1 1`이면 스킵(exit 0).
+Linux 뷰어(viewer_x11)의 AV1 빌드에는 `libdav1d-dev`가 필요하다
+(`connect.sh`가 없으면 안내 후 중단; `./viewer --selftest`는 내장 AV1
+키프레임을 dav1d로 디코딩해 검증).
 
 AV1용 라이브러리는 vcpkg로 설치 — 이 솔루션은 정적 CRT(/MT)라 static
 triplet이어야 한다:

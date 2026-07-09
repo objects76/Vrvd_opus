@@ -6,14 +6,22 @@ cd "$(dirname "$0")/simple/viewer"
 
 # rebuild when any source the binary depends on is newer than it
 if [ ! -x viewer ] || [ viewer_x11.cpp -nt viewer ] \
+   || [ ../common/config.h -nt viewer ] \
    || [ ../common/scap_stream.h  -nt viewer ] \
    || [ ../common/scap_packet.h  -nt viewer ] \
    || [ ../common/zstd_stream.h  -nt viewer ] \
+   || [ ../common/av1_decoder.h  -nt viewer ] \
    || [ ../common/scap_palette.h -nt viewer ] \
    || [ ../common/scap_332dither.h -nt viewer ] \
    || [ ../common/scap_256map.h -nt viewer ]; then
     echo "rebuilding viewer..."
-    g++ -O2 -Wall -o viewer viewer_x11.cpp -lX11 -lzstd -lpthread
+    # USE_AV1 (common/config.h) decodes with dav1d; headers come from
+    # libdav1d-dev (the libdav1d6 runtime alone is not enough)
+    if [ ! -e /usr/include/dav1d/dav1d.h ]; then
+        echo "missing dav1d headers: sudo apt install libdav1d-dev" >&2
+        exit 1
+    fi
+    g++ -O2 -Wall -o viewer viewer_x11.cpp -lX11 -lzstd -ldav1d -lpthread
     ./viewer --selftest
 fi
 
