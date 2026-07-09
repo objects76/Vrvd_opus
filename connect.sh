@@ -25,13 +25,15 @@ if [ ! -x viewer ] || [ viewer_x11.cpp -nt viewer ] \
    || [ ../common/scap_256map.h -nt viewer ] \
    || [ "$ZSTD_LIB/libzstd.a" -nt viewer ]; then
     echo "rebuilding viewer..."
-    # USE_AV1 (common/config.h) decodes with dav1d; headers come from
-    # libdav1d-dev (the libdav1d6 runtime alone is not enough)
-    if [ ! -e /usr/include/dav1d/dav1d.h ]; then
-        echo "missing dav1d headers: sudo apt install libdav1d-dev" >&2
+    # USE_AV1 (common/config.h) decodes with dav1d; headers are vendored (no
+    # sudo on this box), runtime links the installed libdav1d.so.6 by exact
+    # soname since there is no dev symlink. zstd 1.5.7 is static from in-tree.
+    if [ ! -e "$DAV1D_INC/dav1d/dav1d.h" ]; then
+        echo "missing vendored dav1d headers in $DAV1D_INC" >&2
         exit 1
     fi
-    g++ -O2 -Wall -o viewer viewer_x11.cpp -lX11 -lzstd -ldav1d -lpthread
+    g++ -O2 -Wall -I"$DAV1D_INC" -I"$ZSTD_LIB" -o viewer viewer_x11.cpp \
+        "$ZSTD_LIB/libzstd.a" -lX11 -l:libdav1d.so.6 -lpthread
     ./viewer --selftest
 fi
 
