@@ -200,12 +200,9 @@ static int CompareCanvas(ScapDec* dec, const std::vector<uint8_t>& ref,
 
 static int PacketTest(void)
 {
-#if USE_AV1
-    /* The packet test hand-builds zstd/palette wire-format packets; with the
-     * AV1 codec selected scapdec rightly rejects them. The AV1 pipeline is
-     * covered by -selftest (capture -> encode -> decode roundtrip). */
-    return 0;
-#else
+    /* Hand-built zstd/palette wire-format packets; scapdec dispatches on the
+     * packet magic, so this runs regardless of what codec an encoder would
+     * use. The AV1 pipeline is covered by -selftest. */
 #ifndef SCAP_USE_256MAP
     /* 0: palette/quantizer roundtrip - expanding an index through kScapPal
      * and re-quantizing at (0,0) (Bayer offset 0) must return the same
@@ -361,15 +358,14 @@ static int PacketTest(void)
 fail:
     ScapDec_Destroy(dec);
     return step; /* 10 + failed case number */
-#endif /* USE_AV1 */
 }
 
-/* Non-interactive check (`test.exe -selftest`): capture one frame, decode it,
- * verify sizes/bounds agree. Exit code 0 = pass. This is the smallest thing
- * that fails if the capture->encode->decode pipeline breaks. */
-static int SelfTest(void)
+/* Capture one frame with the given codec spec, decode it, verify
+ * sizes/bounds agree. Returns 0 on pass (same exit codes as before:
+ * 1 create, 2 no frame, 3 decode/consistency, 4 capture error). */
+static int RoundTrip(const char* codec)
 {
-    ScapEnc* enc = ScapEnc_Create();
+    ScapEnc* enc = ScapEnc_Create(codec);
     if (!enc)
         return 1;
     ScapDec* dec = ScapDec_Create();
@@ -405,6 +401,20 @@ static int SelfTest(void)
     return ret;
 }
 
+/* Non-interactive check (`test.exe -selftest`): the capture->encode->decode
+ * roundtrip must pass for every runtime codec spec. Exit code 0 = pass. */
+static int SelfTest(void)
+{
+    static const char* specs[] = { "zstd:6", "av1:i420", "av1:i444" };
+    for (const char* spec : specs)
+        if (int ret = RoundTrip(spec))
+            return ret;
+    /* a bad spec must be rejected, not silently defaulted */
+    if (ScapEnc_Create("mp4") != nullptr || ScapEnc_Create("zstd:99") != nullptr)
+        return 5;
+    return 0;
+}
+
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR lpCmdLine, int nCmdShow)
 {
     if (strstr(lpCmdLine, "-packettest"))
@@ -412,10 +422,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR lpCmdLine, int nCmdShow)
     if (strstr(lpCmdLine, "-selftest"))
         return SelfTest();
 
-    g_enc = ScapEnc_Create();
+    /* A bare (non-flag) command line is a codec spec, e.g. `test.exe av1:i444`;
+     * empty = config.h SCAP_CODEC_DEFAULT. */
+    const char* codec =
+        (lpCmdLine && lpCmdLine[0] && lpCmdLine[0] != '-') ? lpCmdLine : nullptr;
+    g_enc = ScapEnc_Create(codec);
     if (!g_enc)
     {
-        MessageBoxA(nullptr, "ScapEnc_Create failed (no D3D11 device?)",
+        MessageBoxA(nullptr,
+                    "ScapEnc_Create failed (bad codec spec / no D3D11 device?)",
                     "scap loopback", MB_ICONERROR);
         return 1;
     }

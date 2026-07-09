@@ -1,16 +1,18 @@
-/* scapenc.cpp - two codec paths, selected by common/config.h USE_AV1:
+/* scapenc.cpp - two codec paths, selected at RUNTIME by the spec string
+ * passed to ScapEnc_Create() ("zstd[:level]" | "av1[:i420|:i444]", see
+ * common/config.h):
  *
- * zstd (USE_AV1=0): BGRA32 -> 8bpp (RGB332 + 4x4 Bayer ordered dithering)
+ * zstd: BGRA32 -> 8bpp (RGB332 + 4x4 Bayer ordered dithering)
  * -> whole-frame payload accumulation -> one streaming zstd flush -> packet.
  * The zs::StreamCompressor (common/zstd_stream.h) lives as long as the
  * encoder, so later packets reference earlier frames as history (see
- * scap_packet.h). Level = config.h ZSTD_LEVEL. Replaced zlib compress2.
- * zs errors are exceptions; this extern "C" boundary catches and translates.
+ * scap_packet.h). Replaced zlib compress2. zs errors are exceptions; this
+ * extern "C" boundary catches and translates.
  *
- * AV1 (USE_AV1=1): full captured frame -> Av1Enc (libaom, Chrome Remote
- * Desktop realtime screen settings, common/av1_encoder.h) -> packet = header
- * + one AV1 temporal unit. The codec's inter prediction replaces the
- * dirty-rect/move machinery, which stays zstd-only.
+ * av1: full captured frame -> Av1Enc (libaom, Chrome Remote Desktop realtime
+ * screen settings, common/av1_encoder.h) -> packet = header + one AV1
+ * temporal unit. The codec's inter prediction replaces the dirty-rect/move
+ * machinery, which stays zstd-only.
  */
 #include "scapenc.h"
 #include "dxgidup.h"
@@ -19,15 +21,16 @@
 #include "../common/scap_packet.h"
 #include "../common/scap_palette.h"
 #include "../common/zstd_stream.h"
-#if USE_AV1
 #include "../common/av1_encoder.h"
-#endif
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <vector>
 
 struct ScapEnc
 {
+    const bool           useAv1;  /* codec chosen at Create, fixed for life */
+    const bool           i444;    /* av1 only: 4:4:4 instead of 4:2:0 */
     DxgiDup              dup;
     ScapQuant            quant;
     std::vector<RECT>    dirty;
@@ -38,13 +41,51 @@ struct ScapEnc
     std::vector<DXGI_OUTDUPL_MOVE_RECT> vMoves;
     std::vector<uint8_t> payload; /* move rects + rect headers + 8bpp pixels */
     std::vector<uint8_t> packet;  /* ScapFrameHdr + zstd blob */
-    zs::StreamCompressor zenc{zs::CompressorOptions{ZSTD_LEVEL}}; /* one continuing frame */
-#if USE_AV1
+    zs::StreamCompressor zenc;    /* one continuing frame (zstd path) */
     Av1Enc               av1;     /* (re)inited on first frame / resize */
-#endif
     unsigned             frameNo = 0;
     long long            totalMovePx = 0;
+
+    ScapEnc(bool av1On, bool i444On, int zstdLevel)
+        : useAv1(av1On), i444(i444On),
+          zenc{zs::CompressorOptions{zstdLevel}} {}
 };
+
+/* Parse a codec spec. Comes off the network (viewer hello), so unknown
+ * codecs / out-of-range levels are rejected, not guessed. */
+static bool ParseCodec(const char* spec, bool* av1, bool* i444, int* level)
+{
+    *av1 = false;
+    *i444 = SCAP_AV1_I444 != 0;
+    *level = ZSTD_LEVEL;
+    if (!spec || !*spec)
+        spec = SCAP_CODEC_DEFAULT;
+    if (strncmp(spec, "zstd", 4) == 0)
+    {
+        const char* p = spec + 4;
+        if (*p == '\0')
+            return true;
+        if (*p != ':')
+            return false;
+        char* end;
+        long v = strtol(p + 1, &end, 10);
+        if (*end || v < 1 || v > 22) /* 22 = ZSTD_maxCLevel() */
+            return false;
+        *level = (int)v;
+        return true;
+    }
+    if (strncmp(spec, "av1", 3) == 0)
+    {
+        *av1 = true;
+        const char* p = spec + 3;
+        if (*p == '\0')
+            return true;
+        if (strcmp(p, ":i420") == 0) { *i444 = false; return true; }
+        if (strcmp(p, ":i444") == 0) { *i444 = true;  return true; }
+        return false;
+    }
+    return false;
+}
 
 /* moveRect.log: per frame that carries moves, how many pixels the old
  * move-as-dirty path would have re-sent vs the 12-byte copy ops actually
@@ -112,12 +153,17 @@ static void LogSessionSummary(ScapEnc* e)
 
 extern "C" {
 
-SCAPENC_API ScapEnc* ScapEnc_Create(void)
+SCAPENC_API ScapEnc* ScapEnc_Create(const char* codec)
 {
+    bool av1, i444;
+    int level;
+    if (!ParseCodec(codec, &av1, &i444, &level))
+        return nullptr;
     ScapEnc* e;
     try
     {
-        e = new ScapEnc(); /* zs::StreamCompressor ctor throws on failure */
+        /* zs::StreamCompressor ctor throws on failure */
+        e = new ScapEnc(av1, i444, level);
     }
     catch (...)
     {
@@ -155,10 +201,12 @@ SCAPENC_API void ScapEnc_RequestFullFrame(ScapEnc* e)
         return;
     e->dup.forceFullFrame = true;
     e->prevValid = false; /* reseed prev so the full frame is sent as pixels */
-#if USE_AV1
-    /* New viewer = fresh decoder: it can only join at a keyframe. */
-    e->av1.RequestKeyframe();
-#else
+    if (e->useAv1)
+    {
+        /* New viewer = fresh decoder: it can only join at a keyframe. */
+        e->av1.RequestKeyframe();
+        return;
+    }
     /* New viewer = fresh decoder on the other end: start a new zstd frame so
      * its first packet is a frame boundary. */
     try
@@ -169,7 +217,6 @@ SCAPENC_API void ScapEnc_RequestFullFrame(ScapEnc* e)
     {
         /* broken cctx: the next compressFrame() will throw and resync */
     }
-#endif
 }
 
 SCAPENC_API int ScapEnc_GetDesktopSize(ScapEnc* e, int* w, int* h)
@@ -200,15 +247,16 @@ SCAPENC_API int ScapEnc_CaptureFrame(ScapEnc* e, int timeoutMs,
     if (!e->dup.Map(&mapped))
         return SCAPENC_ERR;
 
-#if USE_AV1
     /* AV1 path: the codec's inter prediction replaces the dirty/move
      * machinery - encode the full frame every time DXGI delivers one. */
+    if (e->useAv1)
     {
         const int w = e->dup.width, h = e->dup.height;
         if (!e->av1.ok() || e->av1.w() != w || e->av1.h() != h)
         {
             /* first frame or resolution change: fresh encoder, keyframe */
-            if (!e->av1.Init(w, h, SCAP_AV1_BITRATE_KBPS, SCAP_AV1_FPS))
+            if (!e->av1.Init(w, h, SCAP_AV1_BITRATE_KBPS, SCAP_AV1_FPS,
+                             e->i444))
             {
                 e->dup.Unmap();
                 return SCAPENC_ERR;
@@ -239,7 +287,7 @@ SCAPENC_API int ScapEnc_CaptureFrame(ScapEnc* e, int timeoutMs,
         *size = (unsigned)e->packet.size();
         return SCAPENC_OK;
     }
-#else
+
     /* Refine DXGI metadata down to the pixels that actually changed by
      * comparing against prev (a BGRA mirror of the client's canvas). On the
      * first frame / after ScapEnc_RequestFullFrame / on resize there is no
@@ -342,7 +390,6 @@ SCAPENC_API int ScapEnc_CaptureFrame(ScapEnc* e, int timeoutMs,
     *packet = e->packet.data();
     *size = (unsigned)e->packet.size();
     return SCAPENC_OK;
-#endif /* USE_AV1 */
 }
 
 } /* extern "C" */

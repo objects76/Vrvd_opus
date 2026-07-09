@@ -8,8 +8,8 @@
  * semantics for a newly attached viewer.
  *
  * Input is desktop BGRA32 (DXGI duplication layout); converted here to I420
- * (or I444 when config.h SCAP_AV1_I444 is set - full-resolution chroma,
- * profile 1) before aom_codec_encode. Error handling is by return value (no
+ * (or I444 when Init(..., i444=true) - full-resolution chroma, profile 1)
+ * before aom_codec_encode. Error handling is by return value (no
  * exceptions), same convention as the rest of the scapenc DLL surface.
  * Requires libaom >= 3.6 (cpu-used 11); vcpkg aom:x64-windows-static.
  */
@@ -31,19 +31,20 @@ public:
     Av1Enc& operator=(const Av1Enc&) = delete;
 
     /* fps only scales rate-control timing (frame duration = 1s/fps in the
-     * microsecond timebase); encoding is still driven per delivered frame. */
-    bool Init(int w, int h, int targetKbps, int fps)
+     * microsecond timebase); encoding is still driven per delivered frame.
+     * useI444 selects 4:4:4 chroma (profile 1) instead of 4:2:0. */
+    bool Init(int w, int h, int targetKbps, int fps, bool useI444)
     {
         Term();
+        i444 = useI444;
         aom_codec_enc_cfg_t cfg;
         if (aom_codec_enc_config_default(aom_codec_av1_cx(), &cfg,
                                          AOM_USAGE_REALTIME) != AOM_CODEC_OK)
             return false;
         cfg.g_w = (unsigned)w;
         cfg.g_h = (unsigned)h;
-#if SCAP_AV1_I444
-        cfg.g_profile = 1; /* 4:4:4 requires the High profile */
-#endif
+        if (i444)
+            cfg.g_profile = 1; /* 4:4:4 requires the High profile */
         cfg.g_timebase.num = 1;
         cfg.g_timebase.den = 1000000; /* microseconds, as CRD uses */
         cfg.g_pass = AOM_RC_ONE_PASS;
@@ -76,13 +77,8 @@ public:
             return false;
         }
 
-#if SCAP_AV1_I444
-        img = aom_img_alloc(nullptr, AOM_IMG_FMT_I444, (unsigned)w,
-                            (unsigned)h, 1);
-#else
-        img = aom_img_alloc(nullptr, AOM_IMG_FMT_I420, (unsigned)w,
-                            (unsigned)h, 1);
-#endif
+        img = aom_img_alloc(nullptr, i444 ? AOM_IMG_FMT_I444 : AOM_IMG_FMT_I420,
+                            (unsigned)w, (unsigned)h, 1);
         if (!img)
         {
             Term();
@@ -180,22 +176,25 @@ private:
                     (uint8_t)(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
             }
         }
-#if SCAP_AV1_I444
-        for (int y = 0; y < height; ++y)
+        if (i444)
         {
-            const uint8_t* row = bgra + (size_t)y * stride;
-            uint8_t* urow = up + (size_t)y * us;
-            uint8_t* vrow = vp + (size_t)y * vs;
-            for (int x = 0; x < width; ++x)
+            for (int y = 0; y < height; ++y)
             {
-                const int b = row[x * 4], g = row[x * 4 + 1], r = row[x * 4 + 2];
-                urow[x] =
-                    (uint8_t)(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
-                vrow[x] =
-                    (uint8_t)(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+                const uint8_t* row = bgra + (size_t)y * stride;
+                uint8_t* urow = up + (size_t)y * us;
+                uint8_t* vrow = vp + (size_t)y * vs;
+                for (int x = 0; x < width; ++x)
+                {
+                    const int b = row[x * 4], g = row[x * 4 + 1],
+                              r = row[x * 4 + 2];
+                    urow[x] =
+                        (uint8_t)(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+                    vrow[x] =
+                        (uint8_t)(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+                }
             }
+            return;
         }
-#else
         for (int cy = 0; cy < (height + 1) / 2; ++cy)
         {
             uint8_t* urow = up + (size_t)cy * us;
@@ -225,13 +224,13 @@ private:
                     (uint8_t)(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
             }
         }
-#endif
     }
 
     aom_codec_ctx_t ctx = {};
     aom_image_t* img = nullptr;
     bool ctxOpen = false;
     bool forceKey = true;
+    bool i444 = false;
     int width = 0, height = 0;
     long long durationUs = 33333;
     aom_codec_pts_t pts = 0;

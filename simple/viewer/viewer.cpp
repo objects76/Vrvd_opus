@@ -1,8 +1,12 @@
 /* viewer.cpp - TCP client for streamserver: connect to a streamserver, receive
- * length-prefixed scap packets, decode them with scapdec and paint the 256-color
+ * length-prefixed scap packets, decode them with scapdec and paint the decoded
  * canvas in a window. The network mirror of test.exe's in-process loopback.
  *
- * Usage: viewer.exe [host]   (host defaults to 127.0.0.1, port SCAP_STREAM_PORT)
+ * Usage: viewer.exe [--addr=host[:port]] [--codec=spec]
+ *   --addr  defaults to 10.1.110.27:44300 (port default SCAP_STREAM_PORT)
+ *   --codec defaults to "zstd:6"; sent to the server in the opening
+ *           ScapHello, which encodes with it ("zstd[:level]",
+ *           "av1[:i420|:i444]"). scapdec follows the packets automatically.
  *
  * A reader thread does the blocking frame reads + decode so the GUI message loop
  * never stalls; scapdec (decode on the reader, paint on the GUI thread) is guarded
@@ -12,10 +16,11 @@
 #include <windows.h>
 #include <windowsx.h> /* GET_X_LPARAM / GET_Y_LPARAM / GET_WHEEL_DELTA_WPARAM */
 #include <stdio.h>
+#include <stdlib.h>
 #include <thread>
 #include <vector>
 #include "scapdec.h"
-#include "config.h" /* SCAP_CODEC_NAME for the title bar */
+#include "config.h" /* SCAP_CODEC_DEFAULT */
 #include "scap_stream.h"
 
 static ScapDec*        g_dec;
@@ -23,7 +28,9 @@ static CRITICAL_SECTION g_lock;   /* guards g_dec (decode vs. paint) */
 static HWND            g_hwnd;
 static SOCKET          g_sock = INVALID_SOCKET;
 static volatile bool   g_running = true;
-static const char*     g_host = "127.0.0.1";
+static const char*     g_host = "10.1.110.27";
+static int             g_port = SCAP_STREAM_PORT;
+static char            g_codec[sizeof(ScapHello::codec)] = SCAP_CODEC_DEFAULT;
 
 /* title-bar stats (written by reader thread, read by GUI timer; benign race) */
 static unsigned g_frames, g_lastPktSize;
@@ -56,10 +63,19 @@ static SOCKET ConnectTo(const char* host, int port)
 
 static void ReaderThread(void)
 {
-    g_sock = ConnectTo(g_host, SCAP_STREAM_PORT);
+    g_sock = ConnectTo(g_host, g_port);
     if (g_sock == INVALID_SOCKET)
     {
         strcpy_s(g_status, "connect failed");
+        return;
+    }
+    /* First bytes on the wire: tell the server which codec to encode with. */
+    ScapHello hello = {};
+    hello.magic = SCAP_HELLO_MAGIC;
+    strcpy_s(hello.codec, g_codec);
+    if (!ScapSendAll(g_sock, &hello, sizeof(hello)))
+    {
+        strcpy_s(g_status, "hello send failed");
         return;
     }
     strcpy_s(g_status, "streaming");
@@ -92,8 +108,8 @@ static void UpdateTitle(void)
         return;
     char buf[160];
     _snprintf_s(buf, _TRUNCATE,
-                "scap viewer [%s] - %s, %u fps, last pkt %u B, %s",
-                g_host, SCAP_CODEC_NAME, g_frames * 1000 / elapsed,
+                "scap viewer [%s:%d] - %s, %u fps, last pkt %u B, %s",
+                g_host, g_port, g_codec, g_frames * 1000 / elapsed,
                 g_lastPktSize, g_status);
     SetWindowTextA(g_hwnd, buf);
     g_frames = 0;
@@ -188,22 +204,32 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR lpCmdLine, int nCmdShow)
      * DWM-upscaled (blurry) and mouse positions sent to the server are offset. */
     SetProcessDPIAware();
 
-    /* Command line is the host (default localhost). Trim surrounding whitespace
-     * and quotes both ends: getaddrinfo rejects a stray trailing space, so a
-     * shell that appends one (e.g. Start-Process) must not break the connect. */
+    /* --addr=host[:port] --codec=spec. Tokenize on whitespace and quotes
+     * (getaddrinfo rejects a stray trailing space, so a shell that appends
+     * one, e.g. Start-Process, must not break the connect). Unknown tokens
+     * are ignored. */
     static char hostBuf[256];
-    if (lpCmdLine && lpCmdLine[0])
+    static char cmdBuf[512];
+    strncpy_s(cmdBuf, lpCmdLine ? lpCmdLine : "", _TRUNCATE);
+    char* ctx = nullptr;
+    for (char* t = strtok_s(cmdBuf, " \t\"", &ctx); t;
+         t = strtok_s(nullptr, " \t\"", &ctx))
     {
-        const char* s = lpCmdLine;
-        while (*s == '"' || *s == ' ' || *s == '\t')
-            ++s;
-        strncpy_s(hostBuf, s, _TRUNCATE);
-        for (int i = (int)strlen(hostBuf) - 1;
-             i >= 0 && (hostBuf[i] == '"' || hostBuf[i] == ' ' || hostBuf[i] == '\t');
-             --i)
-            hostBuf[i] = '\0';
-        if (hostBuf[0])
-            g_host = hostBuf;
+        if (strncmp(t, "--addr=", 7) == 0 && t[7])
+        {
+            strncpy_s(hostBuf, t + 7, _TRUNCATE);
+            if (char* colon = strrchr(hostBuf, ':'))
+            {
+                *colon = '\0';
+                int port = atoi(colon + 1);
+                if (port > 0 && port < 65536)
+                    g_port = port;
+            }
+            if (hostBuf[0])
+                g_host = hostBuf;
+        }
+        else if (strncmp(t, "--codec=", 8) == 0 && t[8])
+            strncpy_s(g_codec, t + 8, _TRUNCATE);
     }
 
     ScapNetInit net;

@@ -223,6 +223,16 @@ static void ReaderThread(void)
         SetStatus("connect failed");
         return;
     }
+    /* First bytes on the wire: ask the server for the codec this build can
+     * decode (the inline decoder is compile-time, config.h USE_AV1). */
+    ScapHello hello = {};
+    hello.magic = SCAP_HELLO_MAGIC;
+    snprintf(hello.codec, sizeof(hello.codec), "%s", SCAP_CODEC_SPEC);
+    if (!ScapSendAll(g_sock, &hello, sizeof(hello)))
+    {
+        SetStatus("hello send failed");
+        return;
+    }
     SetStatus("streaming");
 
     std::vector<char> frame;
